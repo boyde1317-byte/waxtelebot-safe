@@ -1,0 +1,16 @@
+{
+  "name": "telegram-feedback-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Telegram feedback intake bot with admin review",
+  "main": "src/bot.js",
+  "scripts": {
+    "start": "node src/bot.js",
+    "test": "node test/smoke.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "dotenv": "^16.4.7",
+    "telegraf": "^4.16.3"
+  }
+}
