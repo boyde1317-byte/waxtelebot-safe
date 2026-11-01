@@ -23,7 +23,16 @@ CREATE TABLE IF NOT EXISTS feedback (
   resolved_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_feedback_status ON feedback(status);
+CREATE INDEX IF NOT EXISTS idx_feedback_user ON feedback(user_id, id);
 `);
+
+// Additive migrations so an existing feedback.db keeps working.
+function ensureColumn(table, column, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all().map(row => row.name);
+  if (!columns.includes(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+ensureColumn('feedback', 'reply_text', 'TEXT');
+ensureColumn('feedback', 'resolved_by', 'INTEGER');
 
 const upsert = db.prepare(`INSERT INTO users (id, username, first_name, joined_at)
   VALUES (@id, @username, @first_name, @joined_at)
@@ -39,11 +48,19 @@ function createFeedback(userId, text) {
 }
 const getFeedbackStatement = db.prepare(`SELECT f.*, u.username, u.first_name FROM feedback f JOIN users u ON u.id=f.user_id WHERE f.id=?`);
 function getFeedback(id) { return getFeedbackStatement.get(id); }
-const openFeedback = db.prepare(`SELECT f.*, u.username, u.first_name FROM feedback f JOIN users u ON u.id=f.user_id WHERE f.status='open' ORDER BY f.id ASC LIMIT ?`);
-function listOpenFeedback(limit = 20) { return openFeedback.all(limit); }
-const resolveFeedbackStatement = db.prepare(`UPDATE feedback SET status='resolved', resolved_at=? WHERE id=? AND status='open'`);
-function resolveFeedback(id) { return resolveFeedbackStatement.run(new Date().toISOString(), id).changes > 0; }
+const openFeedback = db.prepare(`SELECT f.*, u.username, u.first_name FROM feedback f JOIN users u ON u.id=f.user_id WHERE f.status='open' ORDER BY f.id ASC LIMIT ? OFFSET ?`);
+function listOpenFeedback(limit = 20, offset = 0) { return openFeedback.all(limit, offset); }
+const userFeedback = db.prepare(`SELECT f.*, u.username, u.first_name FROM feedback f JOIN users u ON u.id=f.user_id WHERE f.user_id=? ORDER BY f.id DESC LIMIT ?`);
+function listUserFeedback(userId, limit = 5) { return userFeedback.all(userId, limit); }
+const resolveFeedbackStatement = db.prepare(`UPDATE feedback SET status='resolved', resolved_at=?, resolved_by=COALESCE(?, resolved_by) WHERE id=? AND status='open'`);
+function resolveFeedback(id, adminId = null) {
+  return resolveFeedbackStatement.run(new Date().toISOString(), adminId, id).changes > 0;
+}
+const replyFeedbackStatement = db.prepare(`UPDATE feedback SET status='resolved', resolved_at=?, reply_text=?, resolved_by=? WHERE id=? AND status='open'`);
+function replyFeedback(id, replyText, adminId = null) {
+  return replyFeedbackStatement.run(new Date().toISOString(), String(replyText), adminId, id).changes > 0;
+}
 const counts = db.prepare(`SELECT COUNT(*) AS total, SUM(status='open') AS open FROM feedback`);
 function feedbackCounts() { const row = counts.get(); return { total: row.total, open: row.open || 0 }; }
 
-module.exports = { db, upsertUser, createFeedback, getFeedback, listOpenFeedback, resolveFeedback, feedbackCounts };
+module.exports = { db, upsertUser, createFeedback, getFeedback, listOpenFeedback, listUserFeedback, resolveFeedback, replyFeedback, feedbackCounts };
