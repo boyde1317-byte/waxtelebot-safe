@@ -8,9 +8,52 @@ const chat = require('../whatsapp/chat');
 const inbox = require('../whatsapp/inbox');
 const { toJid, toPhoneDigits, jidLabel } = require('../whatsapp/jid');
 
-const pendingInput = new Map(); // adminId -> { step, jid }
-const activeChat = new Map(); // adminId -> jid the chat buttons act on
-const reportTarget = new Map(); // adminId -> message id awaiting a report decision
+const pendingInput = new Map(); // adminId -> { step, jid, accountId }
+const activeChat = new Map(); // `${adminId}:${accountId}` -> jid the chat buttons act on
+const pendingReports = new Map(); // token -> { entryId, jid, accountId, adminId, createdAt, consumed }
+
+function chatKey(adminId, accountId) {
+  return `${adminId}:${accountId}`;
+}
+
+function getActiveChat(adminId, accountId) {
+  if (!accountId) return null;
+  return activeChat.get(chatKey(adminId, accountId)) || null;
+}
+
+function setActiveChat(adminId, accountId, jid) {
+  if (!accountId) return;
+  activeChat.set(chatKey(adminId, accountId), jid);
+}
+
+function clearActiveChat(adminId, accountId = null) {
+  if (accountId !== null) {
+    activeChat.delete(chatKey(adminId, accountId));
+  } else {
+    for (const key of Array.from(activeChat.keys())) {
+      if (key.startsWith(`${adminId}:`)) activeChat.delete(key);
+    }
+  }
+}
+
+function createReportToken(adminId, accountId, entry) {
+  const now = Date.now();
+  for (const [key, val] of Array.from(pendingReports.entries())) {
+    if (val.consumed || now - val.createdAt > 30 * 60 * 1000) {
+      pendingReports.delete(key);
+    }
+  }
+  const token = Math.random().toString(36).slice(2, 8) + Date.now().toString(36).slice(-4);
+  pendingReports.set(token, {
+    entryId: entry.id,
+    jid: entry.jid,
+    accountId,
+    adminId,
+    createdAt: now,
+    consumed: false,
+  });
+  return token;
+}
 
 const MUTE_OPTIONS = {
   mute8: { label: 'Muted for 8 hours', ms: 8 * 60 * 60 * 1000 },
@@ -340,7 +383,7 @@ async function runChatAction(ctx, session, jid, action) {
         return ctx.reply(`Messages cleared from ${jidLabel(jid)}.`);
       case 'delete':
         await chat.deleteChat(session, jid, country);
-        activeChat.delete(ctx.from.id);
+        clearActiveChat(ctx.from.id, session.id);
         return ctx.reply(`${jidLabel(jid)} deleted from the chat list.`);
       case 'block':
         await chat.setBlocked(session, jid, true, country);
@@ -355,27 +398,27 @@ async function runChatAction(ctx, session, jid, action) {
             `Nothing from ${jidLabel(jid)} to report on ${session.snapshot.label}.\n\nWhatsApp takes reports against a specific message, and I only hold messages that arrive while the bot is connected. Wait for one to come in, then try again.`
           );
         }
-        reportTarget.set(ctx.from.id, entry.id);
+        const token = createReportToken(ctx.from.id, session.id, entry);
         const preview = (entry.text || '(media without a caption)').slice(0, 160);
         const pairedCount = accounts.list().filter(a => a.status.hasCreds).length;
         const inlineKeyboard = [
           [
-            { text: 'Report', callback_data: 'wacr:solo' },
-            { text: 'Report and block', callback_data: 'wacr:block' },
+            { text: 'Report', callback_data: `wacr:solo:${token}` },
+            { text: 'Report and block', callback_data: `wacr:block:${token}` },
           ],
         ];
         if (pairedCount > 1) {
           inlineKeyboard.push([
-            { text: `Report all (${pairedCount} sessions)`, callback_data: 'wacr:all' },
-            { text: 'Report & block all', callback_data: 'wacr:all_block' },
+            { text: `Report all (${pairedCount} sessions)`, callback_data: `wacr:all:${token}` },
+            { text: 'Report & block all', callback_data: `wacr:all_block:${token}` },
           ]);
         } else {
           inlineKeyboard.push([
-            { text: 'Report (all paired sessions)', callback_data: 'wacr:all' },
-            { text: 'Report & block all', callback_data: 'wacr:all_block' },
+            { text: 'Report (all paired sessions)', callback_data: `wacr:all:${token}` },
+            { text: 'Report & block all', callback_data: `wacr:all_block:${token}` },
           ]);
         }
-        inlineKeyboard.push([{ text: 'Cancel', callback_data: 'wacr:cancel' }]);
+        inlineKeyboard.push([{ text: 'Cancel', callback_data: `wacr:cancel:${token}` }]);
 
         return ctx.reply(
           [
@@ -421,7 +464,7 @@ async function runChatAction(ctx, session, jid, action) {
 async function openChat(ctx, session, rawJid) {
   const jid = toJid(rawJid, config.waDefaultCountry);
   if (!jid) return ctx.reply('That is not a valid number or group id.');
-  activeChat.set(ctx.from.id, jid);
+  setActiveChat(ctx.from.id, session.id, jid);
   return ctx.reply(`Chat: ${jidLabel(jid)}\nAccount: ${session.snapshot.label}\nWhat should I do with it?`, chatKeyboard());
 }
 
@@ -483,6 +526,7 @@ function register(bot) {
       : rows.find(row => row.label.toLowerCase() === arg.toLowerCase());
     if (!pick) return ctx.reply('No account matches that.');
     accounts.setActive(ctx.from.id, pick.id);
+    clearStage(ctx.from.id);
     return ctx.reply(`Switched to ${pick.label}${pick.phone ? ` +${pick.phone}` : ''}.`);
   });
 
@@ -500,6 +544,8 @@ function register(bot) {
     if (!requireAdmin(ctx)) return;
     const session = sessionFor(ctx);
     if (!session) return;
+    clearActiveChat(ctx.from.id, session.id);
+    clearStage(ctx.from.id);
     await accounts.remove(session.id);
     return ctx.reply(`Unpaired ${session.snapshot.label} and deleted its saved session.`);
   });
@@ -546,7 +592,7 @@ function register(bot) {
     const session = sessionFor(ctx);
     if (!session) return;
     const targetRaw = ctx.message.text.replace(/^\/reportall\s*/i, '').trim();
-    const jid = targetRaw ? toJid(targetRaw, config.waDefaultCountry) : activeChat.get(ctx.from.id);
+    const jid = targetRaw ? toJid(targetRaw, config.waDefaultCountry) : getActiveChat(ctx.from.id, session.id);
     if (!jid) {
       return ctx.reply('Usage: /reportall <number|group-id>, or run it while in a chat.');
     }
@@ -554,7 +600,7 @@ function register(bot) {
     if (!entry) {
       return ctx.reply(`No recent message from ${jidLabel(jid)} on ${session.snapshot.label} to report.`);
     }
-    reportTarget.set(ctx.from.id, entry.id);
+    const token = createReportToken(ctx.from.id, session.id, entry);
     const preview = (entry.text || '(media without caption)').slice(0, 160);
     const pairedCount = accounts.list().filter(a => a.status.hasCreds).length;
     return ctx.reply(
@@ -569,11 +615,11 @@ function register(bot) {
         reply_markup: {
           inline_keyboard: [
             [
-              { text: `Route to all (${pairedCount || 1})`, callback_data: 'wacr:all' },
-              { text: 'Route & block all', callback_data: 'wacr:all_block' },
+              { text: `Route to all (${pairedCount || 1})`, callback_data: `wacr:all:${token}` },
+              { text: 'Route & block all', callback_data: `wacr:all_block:${token}` },
             ],
             [
-              { text: 'Cancel', callback_data: 'wacr:cancel' },
+              { text: 'Cancel', callback_data: `wacr:cancel:${token}` },
             ],
           ],
         },
@@ -584,8 +630,7 @@ function register(bot) {
   bot.command('cancelwa', ctx => {
     if (!requireAdmin(ctx)) return;
     clearStage(ctx.from.id);
-    activeChat.delete(ctx.from.id);
-    reportTarget.delete(ctx.from.id);
+    clearActiveChat(ctx.from.id);
     return ctx.reply('Cancelled.');
   });
 
@@ -619,8 +664,8 @@ function register(bot) {
       await ctx.answerCbQuery('Unknown account');
       return undefined;
     }
+    clearStage(ctx.from.id);
     const session = accounts.get(id);
-    activeChat.delete(ctx.from.id);
     await ctx.answerCbQuery(`Switched to ${session.snapshot.label}`);
     const index = accounts.list().findIndex(row => row.id === id);
     const page = index < 0 ? 0 : Math.floor(index / ACCOUNTS_PER_PAGE);
@@ -678,8 +723,9 @@ function register(bot) {
     }
     await ctx.answerCbQuery('Unpairing…');
     const label = session.snapshot.label;
+    clearActiveChat(ctx.from.id, id);
+    clearStage(ctx.from.id);
     await accounts.remove(id);
-    activeChat.delete(ctx.from.id);
     return ctx.reply(`${label} unpaired and its session deleted.`);
   });
 
@@ -698,6 +744,8 @@ function register(bot) {
       return ctx.reply('No account is active.');
     }
     await ctx.answerCbQuery('Unpairing…');
+    clearActiveChat(ctx.from.id, session.id);
+    clearStage(ctx.from.id);
     await accounts.remove(session.id);
     return ctx.reply(`${session.snapshot.label} unpaired.`);
   });
@@ -762,12 +810,12 @@ function register(bot) {
   bot.action(/^wac:(.+)$/, async ctx => {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
     const action = ctx.match[1];
-    const jid = activeChat.get(ctx.from.id);
     const session = sessionFor(ctx);
     if (!session) {
       await ctx.answerCbQuery();
       return undefined;
     }
+    const jid = getActiveChat(ctx.from.id, session.id);
     if (!jid) {
       await ctx.answerCbQuery();
       return ctx.reply('Pick a chat first with /chat <number or group>.');
@@ -785,22 +833,57 @@ function register(bot) {
   // --- report confirmation -------------------------------------------------
   bot.action(/^wacr:(.+)$/, async ctx => {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
-    const choice = ctx.match[1];
-    const session = sessionFor(ctx);
-    if (!session) {
-      await ctx.answerCbQuery();
-      return undefined;
+    const raw = ctx.match[1];
+    const [choice, token] = raw.split(':');
+
+    if (!token || !pendingReports.has(token)) {
+      await ctx.answerCbQuery('Invalid or expired');
+      return ctx.reply('This report confirmation request is invalid, expired, or already processed.');
     }
-    const entryId = reportTarget.get(ctx.from.id);
+
+    const pending = pendingReports.get(token);
+    if (pending.adminId !== ctx.from.id) {
+      return ctx.answerCbQuery('Only the administrator who initiated this report can confirm it.');
+    }
+
+    if (pending.consumed) {
+      await ctx.answerCbQuery('Already processed');
+      return ctx.reply('This report request has already been processed.');
+    }
+
+    if (Date.now() - pending.createdAt > 15 * 60 * 1000) {
+      pendingReports.delete(token);
+      await ctx.answerCbQuery('Expired');
+      return ctx.reply('This report confirmation request has expired.');
+    }
+
     if (choice === 'cancel') {
-      reportTarget.delete(ctx.from.id);
+      pending.consumed = true;
+      pendingReports.delete(token);
       await ctx.answerCbQuery();
       return ctx.reply('Report cancelled.');
     }
-    const entry = entryId ? inbox.get(entryId) : null;
-    if (!entry) {
-      await ctx.answerCbQuery();
-      return ctx.reply('That message is no longer in the recent list, so there is nothing to report.');
+
+    // Mark consumed synchronously to prevent duplicate callback execution / double-taps
+    pending.consumed = true;
+    pendingReports.delete(token);
+
+    const session = accounts.get(pending.accountId);
+    if (!session) {
+      await ctx.answerCbQuery('Account unavailable');
+      return ctx.reply('The WhatsApp account used to initiate this report is no longer available.');
+    }
+
+    const entry = inbox.get(pending.entryId);
+    if (!entry || entry.jid !== pending.jid) {
+      await ctx.answerCbQuery('Message unavailable');
+      return ctx.reply('That message is no longer in the recent buffer, so there is nothing to report.');
+    }
+
+    let subject = null;
+    if (entry.isGroup) {
+      subject = await chat.groupMembers(session, entry.jid, 1, config.waDefaultCountry)
+        .then(info => info.subject).catch(() => null);
     }
 
     const isAll = choice === 'all' || choice === 'all_block';
@@ -809,17 +892,11 @@ function register(bot) {
     if (isAll) {
       await ctx.answerCbQuery('Routing report across paired sessions…');
       try {
-        let subject = null;
-        if (entry.isGroup) {
-          subject = await chat.groupMembers(session, entry.jid, 1, config.waDefaultCountry)
-            .then(info => info.subject).catch(() => null);
-        }
         const pairedRows = accounts.list().filter(a => a.status.hasCreds);
         const sessionsToRoute = pairedRows.map(r => accounts.get(r.id)).filter(Boolean);
         if (!sessionsToRoute.length) sessionsToRoute.push(session);
 
         const results = await chat.reportMessageAll(sessionsToRoute, entry, { block: doBlock, subject });
-        reportTarget.delete(ctx.from.id);
 
         const lines = [`Report routed through ${results.length} paired session(s):`];
         for (const r of results) {
@@ -832,8 +909,10 @@ function register(bot) {
             lines.push(`• ${iden}: Unanswered`);
           } else if (r.status === 'disconnected') {
             lines.push(`• ${iden}: Skipped (disconnected)`);
+          } else if (r.status === 'error') {
+            lines.push(`• ${iden}: Error response from server`);
           } else {
-            lines.push(`• ${iden}: Failed (${r.error})`);
+            lines.push(`• ${iden}: Failed (${r.error || r.status})`);
           }
         }
         if (doBlock) lines.push('\nBlock applied across available sessions.');
@@ -844,47 +923,36 @@ function register(bot) {
       }
     }
 
-    await ctx.answerCbQuery('Reporting and auto-routing to paired sessions…');
+    // Solo report: only reports through the active session without automatic cascading
+    await ctx.answerCbQuery(doBlock ? 'Reporting and blocking…' : 'Reporting…');
     try {
-      let subject = null;
-      if (entry.isGroup) {
-        subject = await chat.groupMembers(session, entry.jid, 1, config.waDefaultCountry)
-          .then(info => info.subject).catch(() => null);
-      }
-      const doBlock = choice === 'block' || choice === 'all_block';
-      const { primary, cascaded } = await chat.reportWithAutoCascade(session, entry, { block: doBlock, subject });
-      reportTarget.delete(ctx.from.id);
+      const result = await chat.reportMessage(session, entry, { block: doBlock, subject });
       const lines = [];
-      if (primary.status === 'confirmed') {
-        lines.push(`Primary session (${session.snapshot.label}): Accepted (id ${primary.reportId}). That is the server acknowledging it, not a promise of removal.`);
-      } else if (primary.status === 'unconfirmed') {
-        lines.push(`Primary session (${session.snapshot.label}): Answered without a report id. Treat as unconfirmed.`);
+      if (result.status === 'confirmed') {
+        lines.push(`WhatsApp accepted the report (id ${result.reportId}). That is the server acknowledging it, not a promise of removal.`);
+      } else if (result.status === 'unconfirmed') {
+        lines.push('WhatsApp answered without a report id. Treat the report as unconfirmed.');
+      } else if (result.status === 'unanswered') {
+        lines.push(`WhatsApp never answered within ${Math.round(config.waQueryTimeoutMs / 1000)}s. The report may not have been accepted.`);
+      } else if (result.status === 'disconnected') {
+        lines.push(`${session.snapshot.label} is disconnected. Report was not delivered.`);
+      } else if (result.status === 'error') {
+        lines.push('WhatsApp rejected the report with an error response.');
       } else {
-        lines.push(`Primary session (${session.snapshot.label}): Never answered within ${Math.round(config.waQueryTimeoutMs / 1000)}s.`);
+        lines.push(`Unexpected report result (${result.status}).`);
       }
-      lines.push(primary.blocked ? `${jidLabel(primary.jid)} is blocked on primary session.` : 'Not blocked on primary session.');
 
-      if (cascaded.length > 0) {
-        lines.push(`\nAuto-report triggered across ${cascaded.length} other paired session(s):`);
-        for (const c of cascaded) {
-          const iden = c.number ? `${c.label} (${c.number})` : c.label;
-          if (c.status === 'confirmed') {
-            lines.push(`• ${iden}: Confirmed (id ${c.reportId})`);
-          } else if (c.status === 'unconfirmed') {
-            lines.push(`• ${iden}: Answered without id`);
-          } else if (c.status === 'unanswered') {
-            lines.push(`• ${iden}: Unanswered`);
-          } else if (c.status === 'disconnected') {
-            lines.push(`• ${iden}: Skipped (disconnected)`);
-          } else {
-            lines.push(`• ${iden}: Failed (${c.error})`);
-          }
+      if (doBlock) {
+        if (result.blocked) {
+          lines.push(`${jidLabel(result.jid)} is blocked.`);
+        } else if (result.blockError) {
+          lines.push(`Could not block ${jidLabel(result.jid)}: ${result.blockError}`);
         }
-        if (doBlock) lines.push('Block status applied across all available sessions.');
       } else {
-        lines.push('No other paired sessions currently aboard to auto-report.');
+        lines.push('Not blocked; block with the Block button if you want to.');
       }
-      if (primary.status !== 'confirmed') lines.push('Reporting from the phone as well is the safer bet.');
+
+      if (result.status !== 'confirmed') lines.push('Reporting from the phone as well is the safer bet.');
       return ctx.reply(lines.join('\n'));
     } catch (error) {
       log.warn('Report failed: %s', error.message);
@@ -899,19 +967,19 @@ function register(bot) {
     const session = sessionFor(ctx);
     await ctx.answerCbQuery();
     if (!session) return undefined;
-    activeChat.set(ctx.from.id, jid);
+    setActiveChat(ctx.from.id, session.id, jid);
     return ctx.reply(`Group: ${jidLabel(jid)}\nAccount: ${session.snapshot.label}`, groupKeyboard());
   });
 
   bot.action(/^wag:(.+)$/, async ctx => {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
     const action = ctx.match[1];
-    const jid = activeChat.get(ctx.from.id);
     const session = sessionFor(ctx);
     if (!session) {
       await ctx.answerCbQuery();
       return undefined;
     }
+    const jid = getActiveChat(ctx.from.id, session.id);
     if (!jid) {
       await ctx.answerCbQuery();
       return ctx.reply('Pick a group from /groups first.');
@@ -934,7 +1002,7 @@ function register(bot) {
       }
       if (action === 'leave') {
         await chat.leaveGroup(session, jid, config.waDefaultCountry);
-        activeChat.delete(ctx.from.id);
+        clearActiveChat(ctx.from.id, session.id);
         return ctx.reply(`Left ${jidLabel(jid)} with ${session.snapshot.label}.`);
       }
       return ctx.reply('I do not know that action.');
@@ -946,6 +1014,7 @@ function register(bot) {
 
   // --- staged text input --------------------------------------------------
   bot.on('text', async (ctx, next) => {
+    if (!isAdmin(ctx)) return next();
     const step = pendingInput.get(ctx.from.id);
     if (!step || ctx.message.text.startsWith('/')) return next();
     const text = ctx.message.text.trim();
@@ -999,4 +1068,7 @@ function register(bot) {
 module.exports = {
   register, statusLine, menuText, menuKeyboard, chatKeyboard, groupKeyboard,
   MUTE_OPTIONS, accountTag,
+  _testHooks: {
+    pendingReports, createReportToken, clearActiveChat, getActiveChat, setActiveChat,
+  },
 };

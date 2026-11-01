@@ -381,6 +381,76 @@ const GROUP = '120363000000000000@g.us';
   assert.strictEqual(cascadeRes.cascaded[1].accountId, unconn.id);
   assert.strictEqual(cascadeRes.cascaded[1].status, 'disconnected');
 
+  // --- report response classification & timeout & blocking error tests ---
+  fakeSocket.queryResult = { tag: 'iq', attrs: { type: 'error' }, content: [] };
+  const errReport = await chat.reportMessage(first, entry);
+  assert.strictEqual(errReport.status, 'error', 'server error node classified as error');
+
+  fakeSocket.queryResult = 'not-an-iq';
+  const invalidReport = await chat.reportMessage(first, entry);
+  assert.strictEqual(invalidReport.status, 'invalid', 'malformed node classified as invalid');
+
+  fakeSocket.queryResult = undefined;
+  const timeoutReport = await chat.reportMessage(first, entry);
+  assert.strictEqual(timeoutReport.status, 'unanswered', 'timeout classified as unanswered');
+
+  // Blocking failure handling
+  fakeSocket.queryResult = { tag: 'iq', attrs: { type: 'result' }, content: [{ tag: 'report_id', content: 'R_BLOCK' }] };
+  fakeSocket.updateBlockStatus = async () => { throw new Error('Network error on block'); };
+  const blockFailReport = await chat.reportMessage(first, entry, { block: true });
+  assert.strictEqual(blockFailReport.status, 'confirmed');
+  assert.strictEqual(blockFailReport.blocked, false);
+  assert.strictEqual(blockFailReport.blockError, 'Network error on block');
+  fakeSocket.updateBlockStatus = async (target, action) => { calls.push({ op: 'updateBlockStatus', jid: target, action }); };
+
+  // Disconnected account handling
+  first.__setSocketForTests(null);
+  const disconnReport = await chat.reportMessage(first, entry);
+  assert.strictEqual(disconnReport.status, 'disconnected');
+  assert.strictEqual(disconnReport.blocked, false);
+  first.__setSocketForTests(fakeSocket);
+
+  // Invalid JID verification
+  await assert.rejects(() => chat.setBlocked(first, 'not_valid', true), /valid number or group/i);
+
+  // Independent admin active account isolation
+  accounts.setActive(42, first.id);
+  accounts.setActive(99, second.id);
+  assert.strictEqual(accounts.active(42).id, first.id);
+  assert.strictEqual(accounts.active(99).id, second.id);
+  accounts.setActive(42, second.id);
+  assert.strictEqual(accounts.active(42).id, second.id);
+  assert.strictEqual(accounts.active(99).id, second.id, 'admin 99 active account stays isolated');
+
+  // --- Stale report confirmation & duplicate callback prevention tests ---
+  const waHandler = require('../src/handlers/whatsapp');
+  const { pendingReports, createReportToken, setActiveChat, getActiveChat, clearActiveChat } = waHandler._testHooks;
+
+  // Active chat account isolation
+  setActiveChat(42, first.id, JID);
+  assert.strictEqual(getActiveChat(42, first.id), JID);
+  assert.strictEqual(getActiveChat(42, second.id), null, 'active chat is isolated per account');
+  clearActiveChat(42, first.id);
+  assert.strictEqual(getActiveChat(42, first.id), null);
+
+  // Token creation & correlation
+  const fakeEntry = { id: 'TEST_MSG_1', jid: JID };
+  const tok = createReportToken(42, first.id, fakeEntry);
+  assert.ok(pendingReports.has(tok));
+  const record = pendingReports.get(tok);
+  assert.strictEqual(record.entryId, 'TEST_MSG_1');
+  assert.strictEqual(record.adminId, 42);
+  assert.strictEqual(record.consumed, false);
+
+  // Consume token (duplicate callback prevention)
+  record.consumed = true;
+  assert.strictEqual(pendingReports.get(tok).consumed, true);
+
+  // Stale/expired rejection
+  const expiredTok = createReportToken(42, first.id, fakeEntry);
+  pendingReports.get(expiredTok).createdAt = Date.now() - 20 * 60 * 1000; // 20m ago
+  assert.ok(Date.now() - pendingReports.get(expiredTok).createdAt > 15 * 60 * 1000);
+
   // --- the recent buffer is per account, not shared ---------------------
   for (let i = 0; i < 3; i += 1) {
     inbox.record({ key: { id: `BULK${i}`, remoteJid: JID }, message: { conversation: `bulk ${i}` } }, first.status());

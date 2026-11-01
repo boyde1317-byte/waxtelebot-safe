@@ -63,13 +63,23 @@ async function setBlocked(account, rawJid, blocked, defaultCountry) {
 // Baileys itself exposes nothing for this and upstream calls it unsupported.
 
 function reportIdFrom(result) {
+  if (!result || typeof result !== 'object') return null;
   const children = Array.isArray(result?.content) ? result.content : [];
   for (const node of children) {
     if (node?.tag !== 'report_id') continue;
-    if (Buffer.isBuffer(node.content)) return node.content.toString('utf8');
-    if (typeof node.content === 'string') return node.content;
+    if (Buffer.isBuffer(node.content)) {
+      const str = node.content.toString('utf8').trim();
+      return str.length ? str : null;
+    }
+    if (typeof node.content === 'string') {
+      const str = node.content.trim();
+      return str.length ? str : null;
+    }
     const first = Array.isArray(node.content) ? node.content[0]?.content : null;
-    return first ? String(first) : null;
+    if (first) {
+      const str = String(first).trim();
+      return str.length ? str : null;
+    }
   }
   return null;
 }
@@ -108,22 +118,77 @@ function buildSpamIq(entry, { flow, subject = null } = {}) {
 }
 
 async function reportMessage(account, entry, { block = false, flow = null, subject = null } = {}) {
-  const sock = account.requireSocket();
   if (!entry?.id) throw new Error('There is no message to report.');
 
+  const isConnected = account.status ? account.status().connected : Boolean(account.socket);
+  if (!isConnected) {
+    return {
+      jid: entry.jid,
+      status: 'disconnected',
+      reportId: null,
+      blocked: false,
+      blockError: null,
+      error: 'Not connected',
+      flow: null,
+    };
+  }
+
+  const sock = account.requireSocket();
   const node = buildSpamIq(entry, { flow, subject });
-  // query() resolves to undefined when the server never answers, so the return
-  // value is the only evidence we have.
-  const result = await sock.query(node, config.waQueryTimeoutMs);
+  let result;
+  try {
+    result = await sock.query(node, config.waQueryTimeoutMs);
+  } catch (err) {
+    const stillConnected = account.status ? account.status().connected : Boolean(account.socket);
+    if (!stillConnected) {
+      return {
+        jid: entry.jid,
+        status: 'disconnected',
+        reportId: null,
+        blocked: false,
+        blockError: null,
+        error: 'Not connected',
+        flow: node.content[0]?.attrs?.spam_flow,
+      };
+    }
+    throw err;
+  }
+
+  let status;
+  if (result === undefined) {
+    status = 'unanswered';
+  } else if (!result || typeof result !== 'object' || result.tag !== 'iq') {
+    status = 'invalid';
+  } else if (result.attrs?.type === 'error') {
+    status = 'error';
+  } else if (result.attrs?.type === 'result') {
+    const reportId = reportIdFrom(result);
+    status = reportId ? 'confirmed' : 'unconfirmed';
+  } else {
+    status = 'unexpected';
+  }
+
   const reportId = reportIdFrom(result);
-  const status = result === undefined ? 'unanswered' : reportId ? 'confirmed' : 'unconfirmed';
 
   let blocked = false;
+  let blockError = null;
   if (block) {
-    await sock.updateBlockStatus(entry.jid, 'block');
-    blocked = true;
+    try {
+      await sock.updateBlockStatus(entry.jid, 'block');
+      blocked = true;
+    } catch (bErr) {
+      blockError = bErr.message;
+    }
   }
-  return { jid: entry.jid, status, reportId, blocked, flow: node.content[0].attrs.spam_flow };
+
+  return {
+    jid: entry.jid,
+    status,
+    reportId,
+    blocked,
+    blockError,
+    flow: node.content[0]?.attrs?.spam_flow,
+  };
 }
 
 async function reportMessageAll(accountSessions, entry, { block = false, flow = null, subject = null } = {}) {
