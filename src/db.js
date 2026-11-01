@@ -35,6 +35,14 @@ CREATE TABLE IF NOT EXISTS wa_sends (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_wa_sends_created ON wa_sends(created_at DESC);
+CREATE TABLE IF NOT EXISTS wa_accounts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  label TEXT NOT NULL DEFAULT '',
+  phone TEXT,
+  jid TEXT,
+  auth_dir TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -48,6 +56,7 @@ function ensureColumn(table, column, definition) {
 }
 ensureColumn('feedback', 'reply_text', 'TEXT');
 ensureColumn('feedback', 'resolved_by', 'INTEGER');
+ensureColumn('wa_sends', 'account_id', 'INTEGER');
 
 const upsert = db.prepare(`INSERT INTO users (id, username, first_name, joined_at)
   VALUES (@id, @username, @first_name, @joined_at)
@@ -77,12 +86,13 @@ function replyFeedback(id, replyText, adminId = null) {
 }
 // --- WhatsApp send log -----------------------------------------------------
 const PREVIEW_LIMIT = 120;
-const insertSend = db.prepare(`INSERT INTO wa_sends (admin_id, jid, kind, body_preview, status, error, created_at)
-  VALUES (@admin_id, @jid, @kind, @body_preview, @status, @error, @created_at)`);
-function logSend({ adminId = null, jid, kind = 'text', body = '', status = 'sent', error = null }) {
+const insertSend = db.prepare(`INSERT INTO wa_sends (admin_id, account_id, jid, kind, body_preview, status, error, created_at)
+  VALUES (@admin_id, @account_id, @jid, @kind, @body_preview, @status, @error, @created_at)`);
+function logSend({ adminId = null, accountId = null, jid, kind = 'text', body = '', status = 'sent', error = null }) {
   const preview = String(body).replace(/\s+/g, ' ').trim().slice(0, PREVIEW_LIMIT);
   const result = insertSend.run({
     admin_id: adminId,
+    account_id: accountId,
     jid: String(jid),
     kind,
     body_preview: preview,
@@ -94,6 +104,27 @@ function logSend({ adminId = null, jid, kind = 'text', body = '', status = 'sent
 }
 const recentSends = db.prepare('SELECT * FROM wa_sends ORDER BY id DESC LIMIT ?');
 function listSends(limit = 10) { return recentSends.all(limit); }
+
+// --- WhatsApp accounts -----------------------------------------------------
+const listAccountsStatement = db.prepare('SELECT * FROM wa_accounts ORDER BY id ASC');
+function listAccounts() { return listAccountsStatement.all(); }
+const insertAccount = db.prepare('INSERT INTO wa_accounts (label, phone, jid, auth_dir, created_at) VALUES (?, ?, NULL, ?, ?)');
+function createAccount({ label, authDir }) {
+  const info = insertAccount.run(label, null, authDir, new Date().toISOString());
+  return getAccount(info.lastInsertRowid);
+}
+const getAccountStatement = db.prepare('SELECT * FROM wa_accounts WHERE id = ?');
+function getAccount(id) { return getAccountStatement.get(id); }
+function updateAccount(id, fields) {
+  const allowed = ['label', 'phone', 'jid'];
+  const keys = Object.keys(fields).filter(key => allowed.includes(key) && fields[key] !== undefined);
+  if (!keys.length) return getAccount(id);
+  const assignments = keys.map(key => `${key} = @${key}`).join(', ');
+  db.prepare(`UPDATE wa_accounts SET ${assignments} WHERE id = @id`).run({ ...fields, id });
+  return getAccount(id);
+}
+const deleteAccountStatement = db.prepare('DELETE FROM wa_accounts WHERE id = ?');
+function deleteAccount(id) { return deleteAccountStatement.run(id).changes > 0; }
 
 // --- key/value settings ----------------------------------------------------
 const readSetting = db.prepare('SELECT value FROM settings WHERE key = ?');
@@ -111,4 +142,5 @@ module.exports = {
   db, upsertUser, createFeedback, getFeedback, listOpenFeedback, listUserFeedback,
   resolveFeedback, replyFeedback, feedbackCounts,
   logSend, listSends, getSetting, setSetting,
+  listAccounts, createAccount, getAccount, updateAccount, deleteAccount,
 };

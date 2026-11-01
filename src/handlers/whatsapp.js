@@ -1,16 +1,16 @@
-// Telegram-side controls for the WhatsApp session: pairing, sending, chat actions, media.
+// Telegram-side controls: several WhatsApp accounts, one active at a time.
 const { Input } = require('telegraf');
 const config = require('../config');
 const db = require('../db');
 const log = require('../utils/logger');
-const wa = require('../whatsapp/session');
+const accounts = require('../whatsapp/accounts');
 const chat = require('../whatsapp/chat');
 const inbox = require('../whatsapp/inbox');
 const { toJid, jidLabel } = require('../whatsapp/jid');
 
 const pendingInput = new Map(); // adminId -> { step, jid }
-const reportTarget = new Map(); // adminId -> message id awaiting a report decision
 const activeChat = new Map(); // adminId -> jid the chat buttons act on
+const reportTarget = new Map(); // adminId -> message id awaiting a report decision
 
 const MUTE_OPTIONS = {
   mute8: { label: 'Muted for 8 hours', ms: 8 * 60 * 60 * 1000 },
@@ -29,25 +29,61 @@ function requireAdmin(ctx) {
   return false;
 }
 
-function statusLine() {
-  const s = wa.status();
-  const bits = [s.connected ? 'Connected' : `Not connected (${s.state})`];
-  if (s.number) bits.push(`+${s.number}`);
-  if (s.connected && s.since) bits.push(`since ${s.since.slice(0, 16).replace('T', ' ')}Z`);
+function accountTag(row) {
+  const phone = row.status?.number || row.phone;
+  return `${row.label}${phone ? ` +${phone}` : ''}`;
+}
+
+function statusLine(session) {
+  const s = session.status();
+  const bits = [s.connected ? 'connected' : s.state === 'pairing' ? 'waiting for the code' : `not connected (${s.state})`];
+  if (s.since) bits.push(`since ${s.since.slice(0, 16).replace('T', ' ')}Z`);
   if (!s.connected && s.lastError) bits.push(s.lastError);
-  if (!s.hasCreds) bits.push('no saved session');
+  if (!s.hasCreds) bits.push('not paired');
   return bits.join(' · ');
 }
 
-function menuKeyboard() {
-  const connected = wa.status().connected;
+function accountButtons(adminId) {
+  const rows = accounts.list();
+  const current = accounts.active(adminId);
+  const buttons = rows.map(row => {
+    const mark = row.status.connected ? '✓' : '·';
+    const me = current && current.id === row.id ? '▸' : '';
+    return {
+      text: `${me}${row.label}${row.phone ? ` +${row.phone}` : ''} ${mark}`.trim(),
+      callback_data: `wa:acct:${row.id}`,
+    };
+  });
+  const lines = [];
+  for (let i = 0; i < buttons.length; i += 2) lines.push(buttons.slice(i, i + 2));
+  lines.push([{ text: '+ Add account', callback_data: 'wa:add' }]);
+  return lines;
+}
+
+function menuText(adminId) {
+  const rows = accounts.list();
+  const current = accounts.active(adminId);
+  const head = ['WhatsApp'];
+  if (!rows.length) {
+    head.push('No accounts linked yet.');
+  } else {
+    const connected = rows.filter(row => row.status.connected).length;
+    head.push(`Active: ${current ? accountTag({ label: current.snapshot.label, status: { number: current.snapshot.number } }) : 'none'}`);
+    head.push(`Accounts: ${rows.length} linked, ${connected} connected`);
+  }
+  head.push('', 'Commands: /pair <number> · /send <target> <text> · /chat <target> · /groups · /media · /accounts · /unpair · /cancelwa');
+  return head.join('\n');
+}
+
+function menuKeyboard(adminId) {
+  const rows = accounts.list();
+  if (!rows.length) {
+    return { reply_markup: { inline_keyboard: [[{ text: '+ Add account', callback_data: 'wa:add' }]] } };
+  }
   return {
     reply_markup: {
       inline_keyboard: [
-        [
-          { text: 'Status', callback_data: 'wa:status' },
-          { text: connected ? 'Unpair' : 'Pair by code', callback_data: connected ? 'wa:unpair' : 'wa:pair' },
-        ],
+        ...accountButtons(adminId),
         [
           { text: 'Send a message', callback_data: 'wa:send' },
           { text: 'Save media', callback_data: 'wa:media' },
@@ -60,61 +96,57 @@ function menuKeyboard() {
           { text: 'Check a number', callback_data: 'wa:check' },
           { text: 'Recent sends', callback_data: 'wa:recent' },
         ],
+        [
+          { text: 'Account status', callback_data: 'wa:status' },
+          { text: 'Unpair this account', callback_data: 'wa:unpairask' },
+        ],
       ],
     },
   };
 }
 
-function menuText() {
-  return [
-    'WhatsApp',
-    statusLine(),
-    '',
-    'Pick an action, or use a command:',
-    '/pair <number> · /send <number|group> <text> · /chat <number|group>',
-    '/groups · /media · /unpair · /cancelwa',
-  ].join('\n');
+function chatKeyboard() {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: 'Mute 8h', callback_data: 'wac:mute8' },
+          { text: 'Mute 1w', callback_data: 'wac:mute1w' },
+          { text: 'Mute always', callback_data: 'wac:muteAlways' },
+        ],
+        [
+          { text: 'Unmute', callback_data: 'wac:unmute' },
+          { text: 'Pin', callback_data: 'wac:pin' },
+          { text: 'Unpin', callback_data: 'wac:unpin' },
+        ],
+        [
+          { text: 'Archive', callback_data: 'wac:archive' },
+          { text: 'Unarchive', callback_data: 'wac:unarchive' },
+          { text: 'Mark read', callback_data: 'wac:read' },
+        ],
+        [
+          { text: 'Clear messages', callback_data: 'wac:clear' },
+          { text: 'Delete chat', callback_data: 'wac:delete' },
+        ],
+        [
+          { text: 'Block', callback_data: 'wac:block' },
+          { text: 'Unblock', callback_data: 'wac:unblock' },
+          { text: 'Report', callback_data: 'wac:report' },
+        ],
+        [
+          { text: 'Contact info', callback_data: 'wac:info' },
+          { text: 'Copy last message', callback_data: 'wac:copy' },
+        ],
+        [
+          { text: 'Send a message', callback_data: 'wac:send' },
+          { text: 'Media in this chat', callback_data: 'wac:media' },
+        ],
+      ],
+    },
+  };
 }
 
-function chatKeyboard(jid) {
-  const actions = [
-    [
-      { text: 'Mute 8h', callback_data: 'wac:mute8' },
-      { text: 'Mute 1w', callback_data: 'wac:mute1w' },
-      { text: 'Mute always', callback_data: 'wac:muteAlways' },
-    ],
-    [
-      { text: 'Unmute', callback_data: 'wac:unmute' },
-      { text: 'Pin', callback_data: 'wac:pin' },
-      { text: 'Unpin', callback_data: 'wac:unpin' },
-    ],
-    [
-      { text: 'Archive', callback_data: 'wac:archive' },
-      { text: 'Unarchive', callback_data: 'wac:unarchive' },
-      { text: 'Mark read', callback_data: 'wac:read' },
-    ],
-    [
-      { text: 'Clear messages', callback_data: 'wac:clear' },
-      { text: 'Delete chat', callback_data: 'wac:delete' },
-    ],
-    [
-      { text: 'Block', callback_data: 'wac:block' },
-      { text: 'Unblock', callback_data: 'wac:unblock' },
-      { text: 'Report', callback_data: 'wac:report' },
-    ],
-    [
-      { text: 'Contact info', callback_data: 'wac:info' },
-      { text: 'Copy last message', callback_data: 'wac:copy' },
-    ],
-    [
-      { text: 'Send a message', callback_data: 'wac:send' },
-      { text: 'Media in this chat', callback_data: 'wac:media' },
-    ],
-  ];
-  return { text: `Chat: ${jidLabel(jid)}\nWhat should I do with it?`, reply_markup: { inline_keyboard: actions } };
-}
-
-function groupKeyboard(jid) {
+function groupKeyboard() {
   return {
     reply_markup: {
       inline_keyboard: [
@@ -140,19 +172,45 @@ function clearStage(adminId) {
   pendingInput.delete(adminId);
 }
 
+// Every action resolves the account the admin is currently driving.
+function sessionFor(ctx) {
+  const session = accounts.active(ctx.from.id);
+  if (!session) {
+    ctx.reply('No WhatsApp account linked yet. Add one with /pair <number> or the Add account button.');
+    return null;
+  }
+  return session;
+}
+
+function unpairedAccount() {
+  const row = accounts.list().find(entry => !entry.status.hasCreds);
+  return row ? accounts.get(row.id) : null;
+}
+
 async function beginPairing(ctx, phone) {
-  await ctx.reply('Requesting a pairing code from WhatsApp…');
+  let session;
   try {
-    const result = await wa.connect({ phone });
-    const code = result?.code;
-    if (!code) return ctx.reply(`Already paired as +${result?.number || 'unknown'}.`);
+    session = unpairedAccount() || accounts.create();
+  } catch (error) {
+    return ctx.reply(`Could not add an account: ${error.message}`);
+  }
+  accounts.setActive(ctx.from.id, session.id);
+  const label = session.snapshot.label;
+  await ctx.reply(`Pairing ${label} with ${phone}…`);
+  try {
+    const result = await session.connect({ phone });
+    if (!result?.code) {
+      return ctx.reply(`${label} is already paired as +${result?.number || 'unknown'}. It is the active account now.`);
+    }
     return ctx.reply(
       [
-        `Pairing code: ${code}`,
+        `Pairing code for ${label}: ${result.code}`,
         '',
         'On the phone with that WhatsApp account:',
         'Settings → Linked devices → Link a device → Link with phone number instead.',
         'Enter the code above. It expires in about a minute.',
+        '',
+        'Add another account any time with /pair <number>; up to ' + config.waMaxAccounts + ' fit.',
       ].join('\n')
     );
   } catch (error) {
@@ -161,23 +219,23 @@ async function beginPairing(ctx, phone) {
   }
 }
 
-async function doSend(ctx, rawJid, text) {
+async function doSend(ctx, session, rawJid, text) {
   try {
-    const result = await wa.sendText({ rawJid, text, adminId: ctx.from.id });
-    return ctx.reply(`Sent to ${jidLabel(result.jid)}.`);
+    const result = await session.sendText({ rawJid, text, adminId: ctx.from.id });
+    return ctx.reply(`Sent to ${jidLabel(result.jid)} from ${session.snapshot.label}.`);
   } catch (error) {
     log.warn('Send failed: %s', error.message);
     return ctx.reply(`Could not send: ${error.message}`);
   }
 }
 
-async function replyGroups(ctx) {
+async function replyGroups(ctx, session) {
   try {
-    const groups = await wa.listGroups();
-    if (!groups.length) return ctx.reply('This account is not in any groups.');
+    const groups = await session.listGroups();
+    if (!groups.length) return ctx.reply(`This account (${session.snapshot.label}) is not in any groups.`);
     const lines = groups.map((g, i) => `${i + 1}. ${g.subject} · ${g.participants} members\n   ${g.jid}`);
     const rows = groups.slice(0, 8).map(g => [{ text: g.subject.slice(0, 40), callback_data: `wa:g:${g.jid}` }]);
-    return ctx.reply(`Groups:\n${lines.join('\n')}`, {
+    return ctx.reply(`${session.snapshot.label} groups:\n${lines.join('\n')}`, {
       reply_markup: rows.length ? { inline_keyboard: rows } : undefined,
     });
   } catch (error) {
@@ -185,16 +243,18 @@ async function replyGroups(ctx) {
   }
 }
 
-async function replyMedia(ctx, jid = null) {
-  const items = inbox.list({ jid, kind: 'media', limit: 8 });
+async function replyMedia(ctx, session, jid = null) {
+  const items = inbox.list({ accountId: session.id, jid, kind: 'media', limit: 8 });
   if (!items.length) {
-    return ctx.reply('Nothing recent. Media shows up here once it arrives while the bot is connected.');
+    return ctx.reply(`Nothing recent on ${session.snapshot.label}. Media shows up here once it arrives while the bot is connected.`);
   }
   const rows = items.map(item => [{
     text: `${inbox.label(item)}`.slice(0, 60),
     callback_data: `wa:m:${item.id}`,
   }]);
-  return ctx.reply('Recent media. Tap one to bring it here.', { reply_markup: { inline_keyboard: rows } });
+  return ctx.reply(`Recent media on ${session.snapshot.label}. Tap one to bring it here.`, {
+    reply_markup: { inline_keyboard: rows },
+  });
 }
 
 function fileNameFor(entry) {
@@ -216,47 +276,49 @@ async function sendMediaToTelegram(ctx, id) {
   }
 }
 
-// Runs one chat action and reports the outcome.
-async function runChatAction(ctx, jid, action) {
+async function runChatAction(ctx, session, jid, action) {
   const country = config.waDefaultCountry;
   const mute = MUTE_OPTIONS[action];
 
   try {
     if (mute) {
-      await chat.setMute(jid, mute.ms, country);
-      return ctx.reply(`${jidLabel(jid)}: ${mute.label}.`);
+      await chat.setMute(session, jid, mute.ms, country);
+      return ctx.reply(`${jidLabel(jid)} on ${session.snapshot.label}: ${mute.label}.`);
     }
     switch (action) {
       case 'pin':
-        await chat.setPin(jid, true, country);
+        await chat.setPin(session, jid, true, country);
         return ctx.reply(`${jidLabel(jid)} pinned.`);
       case 'unpin':
-        await chat.setPin(jid, false, country);
+        await chat.setPin(session, jid, false, country);
         return ctx.reply(`${jidLabel(jid)} unpinned.`);
       case 'archive':
-        await chat.setArchive(jid, true, country);
+        await chat.setArchive(session, jid, true, country);
         return ctx.reply(`${jidLabel(jid)} archived.`);
       case 'unarchive':
-        await chat.setArchive(jid, false, country);
+        await chat.setArchive(session, jid, false, country);
         return ctx.reply(`${jidLabel(jid)} unarchived.`);
       case 'read':
-        await chat.markRead(jid, country);
+        await chat.markRead(session, jid, country);
         return ctx.reply(`${jidLabel(jid)} marked as read.`);
       case 'clear':
-        await chat.clearChat(jid, country);
+        await chat.clearChat(session, jid, country);
         return ctx.reply(`Messages cleared from ${jidLabel(jid)}.`);
       case 'delete':
-        await chat.deleteChat(jid, country);
+        await chat.deleteChat(session, jid, country);
         activeChat.delete(ctx.from.id);
         return ctx.reply(`${jidLabel(jid)} deleted from the chat list.`);
       case 'block':
-        await chat.setBlocked(jid, true, country);
+        await chat.setBlocked(session, jid, true, country);
         return ctx.reply(`${jidLabel(jid)} blocked.`);
+      case 'unblock':
+        await chat.setBlocked(session, jid, false, country);
+        return ctx.reply(`${jidLabel(jid)} unblocked.`);
       case 'report': {
-        const [entry] = inbox.list({ jid, limit: 1 });
+        const [entry] = inbox.list({ accountId: session.id, jid, limit: 1 });
         if (!entry) {
           return ctx.reply(
-            `Nothing from ${jidLabel(jid)} to report.\n\nWhatsApp takes reports against a specific message, and I only hold messages that arrive while the bot is connected. Wait for one to come in, then try again.`
+            `Nothing from ${jidLabel(jid)} to report on ${session.snapshot.label}.\n\nWhatsApp takes reports against a specific message, and I only hold messages that arrive while the bot is connected. Wait for one to come in, then try again.`
           );
         }
         reportTarget.set(ctx.from.id, entry.id);
@@ -282,17 +344,14 @@ async function runChatAction(ctx, jid, action) {
         );
       }
       case 'copy': {
-        const last = inbox.lastText(jid);
+        const last = inbox.lastText(jid, session.id);
         if (!last) {
           return ctx.reply(`Nothing to copy from ${jidLabel(jid)} yet. I only keep messages that arrive while the bot is connected.`);
         }
         return ctx.reply(`Last message from ${jidLabel(jid)}:\n\n${last.text}`);
       }
-      case 'unblock':
-        await chat.setBlocked(jid, false, country);
-        return ctx.reply(`${jidLabel(jid)} unblocked.`);
       case 'info': {
-        const info = await chat.contactInfo(jid, country);
+        const info = await chat.contactInfo(session, jid, country);
         const lines = [
           info.label,
           info.exists === null ? null : info.exists ? 'on WhatsApp' : 'not on WhatsApp',
@@ -310,12 +369,11 @@ async function runChatAction(ctx, jid, action) {
   }
 }
 
-async function openChat(ctx, rawJid) {
+async function openChat(ctx, session, rawJid) {
   const jid = toJid(rawJid, config.waDefaultCountry);
   if (!jid) return ctx.reply('That is not a valid number or group id.');
   activeChat.set(ctx.from.id, jid);
-  const { text, reply_markup } = chatKeyboard(jid);
-  return ctx.reply(text, { reply_markup });
+  return ctx.reply(`Chat: ${jidLabel(jid)}\nAccount: ${session.snapshot.label}\nWhat should I do with it?`, chatKeyboard());
 }
 
 function register(bot) {
@@ -325,17 +383,45 @@ function register(bot) {
     }
   }
 
-  wa.subscribe((type, payload) => {
-    if (type === 'open') notifyAdmins(`WhatsApp connected as +${payload.number || 'unknown'}.`);
-    if (type === 'loggedOut') notifyAdmins(`WhatsApp session ended: ${payload.reason || 'logged out'}. Pair again with /wa.`);
-    if (type === 'pairingFailed') notifyAdmins(`Pairing did not complete (${payload.reason || 'code not accepted'}). Send /pair for a fresh code.`);
-    if (type === 'reconnectFailed') notifyAdmins('WhatsApp could not reconnect. Use /wa to check and pair again.');
+  accounts.subscribeAll((type, payload) => {
+    const label = payload.label || `Account ${payload.id}`;
+    if (type === 'open') notifyAdmins(`${label} connected as +${payload.number || 'unknown'}.`);
+    if (type === 'loggedOut') notifyAdmins(`${label} session ended: ${payload.reason || 'logged out'}. Pair again with /pair.`);
+    if (type === 'pairingFailed') notifyAdmins(`${label} pairing did not complete (${payload.reason || 'code not accepted'}). Send /pair for a fresh code.`);
+    if (type === 'reconnectFailed') notifyAdmins(`${label} could not reconnect. Use /accounts to check it.`);
   });
+
+  const showMenu = async ctx => {
+    const { reply_markup } = menuKeyboard(ctx.from.id);
+    return ctx.reply(menuText(ctx.from.id), { reply_markup });
+  };
 
   // --- commands -----------------------------------------------------------
   bot.command('wa', async ctx => {
     if (!requireAdmin(ctx)) return;
-    return ctx.reply(menuText(), menuKeyboard());
+    return showMenu(ctx);
+  });
+
+  bot.command('accounts', async ctx => {
+    if (!requireAdmin(ctx)) return;
+    const rows = accounts.list();
+    if (!rows.length) return showMenu(ctx);
+    const current = accounts.active(ctx.from.id);
+    const lines = rows.map(row => `${current && current.id === row.id ? '▸' : ' '} ${row.label}${row.phone ? ` +${row.phone}` : ''} · ${statusLine(accounts.get(row.id))}`);
+    return ctx.reply(`WhatsApp accounts:\n${lines.join('\n')}`, { reply_markup: menuKeyboard(ctx.from.id).reply_markup });
+  });
+
+  bot.command('account', async ctx => {
+    if (!requireAdmin(ctx)) return;
+    const arg = ctx.message.text.replace(/^\/account\s*/i, '').trim();
+    if (!arg) return ctx.reply('Usage: /account <number> to switch, or /accounts to list.');
+    const rows = accounts.list();
+    const pick = /^\d+$/.test(arg)
+      ? rows.find((row, index) => index + 1 === Number(arg) || row.id === Number(arg))
+      : rows.find(row => row.label.toLowerCase() === arg.toLowerCase());
+    if (!pick) return ctx.reply('No account matches that.');
+    accounts.setActive(ctx.from.id, pick.id);
+    return ctx.reply(`Switched to ${pick.label}${pick.phone ? ` +${pick.phone}` : ''}.`);
   });
 
   bot.command('pair', async ctx => {
@@ -343,64 +429,139 @@ function register(bot) {
     const phone = ctx.message.text.replace(/^\/pair\s*/i, '').trim();
     if (!phone) {
       stage(ctx.from.id, 'pair');
-      return ctx.reply('Send the phone number with country code, e.g. +233241234567.');
+      return ctx.reply('Send the phone number with country code, e.g. +233241234567. This adds it as a new account.');
     }
     return beginPairing(ctx, phone);
   });
 
   bot.command('unpair', async ctx => {
     if (!requireAdmin(ctx)) return;
-    await wa.logout();
-    return ctx.reply('WhatsApp unpaired and the saved session was deleted.');
+    const session = sessionFor(ctx);
+    if (!session) return;
+    await accounts.remove(session.id);
+    return ctx.reply(`Unpaired ${session.snapshot.label} and deleted its saved session.`);
   });
 
   bot.command('send', async ctx => {
     if (!requireAdmin(ctx)) return;
+    const session = sessionFor(ctx);
+    if (!session) return;
     const rest = ctx.message.text.replace(/^\/send\s*/i, '').trim();
     const [destination, ...words] = rest.split(/\s+/);
     const text = words.join(' ').trim();
     if (!destination || !text) return ctx.reply('Usage: /send <number|group-id> <message>');
-    return doSend(ctx, destination, text);
+    return doSend(ctx, session, destination, text);
   });
 
   bot.command('chat', async ctx => {
     if (!requireAdmin(ctx)) return;
+    const session = sessionFor(ctx);
+    if (!session) return;
     const target = ctx.message.text.replace(/^\/chat\s*/i, '').trim();
     if (!target) {
       stage(ctx.from.id, 'chat_target');
       return ctx.reply('Which chat? Send a number with country code, or a group id ending in @g.us.');
     }
-    return openChat(ctx, target);
+    return openChat(ctx, session, target);
   });
 
   bot.command('groups', async ctx => {
     if (!requireAdmin(ctx)) return;
-    return replyGroups(ctx);
+    const session = sessionFor(ctx);
+    if (!session) return;
+    return replyGroups(ctx, session);
   });
 
   bot.command('media', async ctx => {
     if (!requireAdmin(ctx)) return;
-    return replyMedia(ctx);
+    const session = sessionFor(ctx);
+    if (!session) return;
+    return replyMedia(ctx, session);
   });
 
   bot.command('cancelwa', ctx => {
     if (!requireAdmin(ctx)) return;
     clearStage(ctx.from.id);
     activeChat.delete(ctx.from.id);
+    reportTarget.delete(ctx.from.id);
     return ctx.reply('Cancelled.');
   });
 
   // --- menu buttons -------------------------------------------------------
   bot.action('wa:menu', async ctx => {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
-    await ctx.editMessageText(menuText(), menuKeyboard()).catch(() => ctx.reply(menuText(), menuKeyboard()));
+    const { reply_markup } = menuKeyboard(ctx.from.id);
+    await ctx.editMessageText(menuText(ctx.from.id), { reply_markup }).catch(() => ctx.reply(menuText(ctx.from.id), { reply_markup }));
     return ctx.answerCbQuery();
+  });
+
+  bot.action(/^wa:acct:(\d+)$/, async ctx => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
+    const id = Number(ctx.match[1]);
+    if (!accounts.setActive(ctx.from.id, id)) {
+      await ctx.answerCbQuery('Unknown account');
+      return undefined;
+    }
+    const session = accounts.get(id);
+    activeChat.delete(ctx.from.id);
+    await ctx.answerCbQuery(`Switched to ${session.snapshot.label}`);
+    const { reply_markup } = menuKeyboard(ctx.from.id);
+    return ctx.reply(menuText(ctx.from.id), { reply_markup }).catch(() => undefined);
+  });
+
+  bot.action('wa:add', async ctx => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
+    await ctx.answerCbQuery();
+    stage(ctx.from.id, 'pair');
+    return ctx.reply('Send the phone number with country code, e.g. +233241234567.');
   });
 
   bot.action('wa:status', async ctx => {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
     await ctx.answerCbQuery();
-    return ctx.reply(statusLine());
+    const rows = accounts.list();
+    if (!rows.length) return ctx.reply('No accounts linked yet.');
+    const lines = rows.map(row => {
+      const session = accounts.get(row.id);
+      return `${row.label}${row.phone ? ` +${row.phone}` : ''}: ${session ? statusLine(session) : 'no session'}`;
+    });
+    return ctx.reply(lines.join('\n'));
+  });
+
+  bot.action('wa:unpairask', async ctx => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
+    const session = accounts.active(ctx.from.id);
+    if (!session) {
+      await ctx.answerCbQuery();
+      return ctx.reply('No account is active.');
+    }
+    await ctx.answerCbQuery();
+    return ctx.reply(
+      `Unpair ${session.snapshot.label}${session.snapshot.number ? ` +${session.snapshot.number}` : ''}?\n\nThis logs out that WhatsApp account and deletes its saved session. The other accounts are untouched.`,
+      {
+        reply_markup: {
+          inline_keyboard: [[
+            { text: 'Unpair it', callback_data: `wa:unpairdo:${session.id}` },
+            { text: 'Cancel', callback_data: 'wa:menu' },
+          ]],
+        },
+      }
+    );
+  });
+
+  bot.action(/^wa:unpairdo:(\d+)$/, async ctx => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
+    const id = Number(ctx.match[1]);
+    const session = accounts.get(id);
+    if (!session) {
+      await ctx.answerCbQuery('Already gone');
+      return undefined;
+    }
+    await ctx.answerCbQuery('Unpairing…');
+    const label = session.snapshot.label;
+    await accounts.remove(id);
+    activeChat.delete(ctx.from.id);
+    return ctx.reply(`${label} unpaired and its session deleted.`);
   });
 
   bot.action('wa:pair', async ctx => {
@@ -412,14 +573,20 @@ function register(bot) {
 
   bot.action('wa:unpair', async ctx => {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
-    await ctx.answerCbQuery();
-    await wa.logout();
-    return ctx.reply('WhatsApp unpaired and the saved session was deleted.');
+    const session = accounts.active(ctx.from.id);
+    if (!session) {
+      await ctx.answerCbQuery();
+      return ctx.reply('No account is active.');
+    }
+    await ctx.answerCbQuery('Unpairing…');
+    await accounts.remove(session.id);
+    return ctx.reply(`${session.snapshot.label} unpaired.`);
   });
 
   bot.action('wa:send', async ctx => {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
     await ctx.answerCbQuery();
+    if (!accounts.active(ctx.from.id)) return ctx.reply('Add an account first with /pair <number>.');
     stage(ctx.from.id, 'send_to');
     return ctx.reply('Who is it going to? Send a number with country code, or a group id ending in @g.us.');
   });
@@ -436,13 +603,15 @@ function register(bot) {
     await ctx.answerCbQuery();
     const rows = db.listSends(8);
     if (!rows.length) return ctx.reply('Nothing sent from here yet.');
-    const lines = rows.map(r => `${r.status === 'sent' ? '✓' : '✗'} ${jidLabel(r.jid)} · ${r.created_at.slice(0, 16).replace('T', ' ')}\n   ${r.body_preview || '(no text)'}${r.error ? `\n   error: ${r.error}` : ''}`);
+    const byId = new Map(accounts.list().map(row => [row.id, row.label]));
+    const lines = rows.map(r => `${r.status === 'sent' ? '✓' : '✗'} ${byId.get(r.account_id) || 'account ?'} → ${jidLabel(r.jid)} · ${r.created_at.slice(0, 16).replace('T', ' ')}\n   ${r.body_preview || '(no text)'}${r.error ? `\n   error: ${r.error}` : ''}`);
     return ctx.reply(lines.join('\n'));
   });
 
   bot.action('wa:chat', async ctx => {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
     await ctx.answerCbQuery();
+    if (!accounts.active(ctx.from.id)) return ctx.reply('Add an account first with /pair <number>.');
     stage(ctx.from.id, 'chat_target');
     return ctx.reply('Which chat? Send a number with country code, or a group id ending in @g.us.');
   });
@@ -450,13 +619,17 @@ function register(bot) {
   bot.action('wa:groups', async ctx => {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
     await ctx.answerCbQuery();
-    return replyGroups(ctx);
+    const session = sessionFor(ctx);
+    if (!session) return undefined;
+    return replyGroups(ctx, session);
   });
 
   bot.action('wa:media', async ctx => {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
     await ctx.answerCbQuery();
-    return replyMedia(ctx);
+    const session = sessionFor(ctx);
+    if (!session) return undefined;
+    return replyMedia(ctx, session);
   });
 
   // --- media download -----------------------------------------------------
@@ -471,6 +644,11 @@ function register(bot) {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
     const action = ctx.match[1];
     const jid = activeChat.get(ctx.from.id);
+    const session = sessionFor(ctx);
+    if (!session) {
+      await ctx.answerCbQuery();
+      return undefined;
+    }
     if (!jid) {
       await ctx.answerCbQuery();
       return ctx.reply('Pick a chat first with /chat <number or group>.');
@@ -481,14 +659,19 @@ function register(bot) {
       stage(ctx.from.id, 'send_text', { jid });
       return ctx.reply(`Message for ${jidLabel(jid)}? Send the text now.`);
     }
-    if (action === 'media') return replyMedia(ctx, jid);
-    return runChatAction(ctx, jid, action);
+    if (action === 'media') return replyMedia(ctx, session, jid);
+    return runChatAction(ctx, session, jid, action);
   });
 
   // --- report confirmation -------------------------------------------------
   bot.action(/^wacr:(.+)$/, async ctx => {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
     const choice = ctx.match[1];
+    const session = sessionFor(ctx);
+    if (!session) {
+      await ctx.answerCbQuery();
+      return undefined;
+    }
     const entryId = reportTarget.get(ctx.from.id);
     if (choice === 'cancel') {
       reportTarget.delete(ctx.from.id);
@@ -504,10 +687,10 @@ function register(bot) {
     try {
       let subject = null;
       if (entry.isGroup) {
-        subject = await chat.groupMembers(entry.jid, 1, config.waDefaultCountry)
+        subject = await chat.groupMembers(session, entry.jid, 1, config.waDefaultCountry)
           .then(info => info.subject).catch(() => null);
       }
-      const result = await chat.reportMessage(entry, { block: choice === 'block', subject });
+      const result = await chat.reportMessage(session, entry, { block: choice === 'block', subject });
       reportTarget.delete(ctx.from.id);
       const lines = [];
       if (result.status === 'confirmed') {
@@ -517,7 +700,7 @@ function register(bot) {
       } else {
         lines.push(`WhatsApp never answered within ${Math.round(config.waQueryTimeoutMs / 1000)}s. The report may not have been accepted.`);
       }
-      lines.push(result.blocked ? `${jidLabel(result.jid)} is blocked.` : `Not blocked; block with the Block button if you want to.`);
+      lines.push(result.blocked ? `${jidLabel(result.jid)} is blocked.` : 'Not blocked; block with the Block button if you want to.');
       if (result.status !== 'confirmed') lines.push('Reporting from the phone as well is the safer bet.');
       return ctx.reply(lines.join('\n'));
     } catch (error) {
@@ -530,15 +713,22 @@ function register(bot) {
   bot.action(/^wa:g:(.+)$/, async ctx => {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
     const jid = ctx.match[1];
+    const session = sessionFor(ctx);
     await ctx.answerCbQuery();
+    if (!session) return undefined;
     activeChat.set(ctx.from.id, jid);
-    return ctx.reply(`Group: ${jidLabel(jid)}`, groupKeyboard(jid));
+    return ctx.reply(`Group: ${jidLabel(jid)}\nAccount: ${session.snapshot.label}`, groupKeyboard());
   });
 
   bot.action(/^wag:(.+)$/, async ctx => {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
     const action = ctx.match[1];
     const jid = activeChat.get(ctx.from.id);
+    const session = sessionFor(ctx);
+    if (!session) {
+      await ctx.answerCbQuery();
+      return undefined;
+    }
     if (!jid) {
       await ctx.answerCbQuery();
       return ctx.reply('Pick a group from /groups first.');
@@ -551,18 +741,18 @@ function register(bot) {
     }
     try {
       if (action === 'link') {
-        const { link } = await chat.groupInvite(jid, config.waDefaultCountry);
+        const { link } = await chat.groupInvite(session, jid, config.waDefaultCountry);
         return ctx.reply(`Invite link for ${jidLabel(jid)}:\n${link}`);
       }
       if (action === 'members') {
-        const info = await chat.groupMembers(jid, 30, config.waDefaultCountry);
+        const info = await chat.groupMembers(session, jid, 30, config.waDefaultCountry);
         const lines = info.members.map(m => `${m.admin ? '*' : '-'} ${m.jid}`);
         return ctx.reply(`${info.subject} · ${info.total} members\n${lines.join('\n')}`);
       }
       if (action === 'leave') {
-        await chat.leaveGroup(jid, config.waDefaultCountry);
+        await chat.leaveGroup(session, jid, config.waDefaultCountry);
         activeChat.delete(ctx.from.id);
-        return ctx.reply(`Left ${jidLabel(jid)}.`);
+        return ctx.reply(`Left ${jidLabel(jid)} with ${session.snapshot.label}.`);
       }
       return ctx.reply('I do not know that action.');
     } catch (error) {
@@ -583,29 +773,35 @@ function register(bot) {
     }
 
     if (step.step === 'send_to' || step.step === 'chat_target') {
+      const session = sessionFor(ctx);
+      if (!session) return true;
       const jid = toJid(text, config.waDefaultCountry);
       if (!jid) {
         await ctx.reply('That is not a valid number or group id. Try again, or /cancelwa.');
         return true;
       }
       clearStage(ctx.from.id);
-      if (step.step === 'chat_target') return openChat(ctx, jid);
+      if (step.step === 'chat_target') return openChat(ctx, session, jid);
       stage(ctx.from.id, 'send_text', { jid });
-      await ctx.reply(`Message for ${jidLabel(jid)}? Send the text now.`);
+      await ctx.reply(`Message for ${jidLabel(jid)} from ${session.snapshot.label}? Send the text now.`);
       return true;
     }
 
     if (step.step === 'send_text') {
+      const session = sessionFor(ctx);
+      if (!session) return true;
       clearStage(ctx.from.id);
-      return doSend(ctx, step.jid, text);
+      return doSend(ctx, session, step.jid, text);
     }
 
     if (step.step === 'check') {
+      const session = sessionFor(ctx);
+      if (!session) return true;
       clearStage(ctx.from.id);
       try {
-        const result = await wa.checkNumber(text);
+        const result = await session.checkNumber(text);
         await ctx.reply(result.exists
-          ? `+${result.digits} is on WhatsApp (${result.jid}).`
+          ? `+${result.digits} is on WhatsApp (${result.jid}) according to ${session.snapshot.label}.`
           : `+${result.digits} does not appear to have WhatsApp.`);
       } catch (error) {
         await ctx.reply(`Could not check that number: ${error.message}`);
@@ -619,5 +815,5 @@ function register(bot) {
 
 module.exports = {
   register, statusLine, menuText, menuKeyboard, chatKeyboard, groupKeyboard,
-  MUTE_OPTIONS,
+  MUTE_OPTIONS, accountTag,
 };

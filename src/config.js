@@ -38,7 +38,14 @@ module.exports = {
   // Set WA_ENABLED=0 to run as a pure feedback bot.
   waEnabled: String(process.env.WA_ENABLED ?? '1') !== '0',
   // Where the paired session (creds.json) is stored. Keep this out of git.
+  // Legacy single-session folder, adopted as an account on first boot.
   waAuthDir: process.env.WA_AUTH_DIR || path.join(__dirname, '..', 'data', 'wa-auth'),
+  // One auth folder per linked account lives under here.
+  waAccountsDir: process.env.WA_ACCOUNTS_DIR || path.join(__dirname, '..', 'data', 'wa-accounts'),
+  // How many WhatsApp accounts one bot can drive.
+  waMaxAccounts: parsePositiveInt(process.env.WA_MAX_ACCOUNTS, 4),
+  // Gap between reconnects on boot so the handshakes do not collide.
+  waRestoreGapMs: parseNonNegativeInt(process.env.WA_RESTORE_GAP_MS, 1500),
   // Country code applied to local numbers written without one, e.g. 233.
   waDefaultCountry: String(process.env.WA_DEFAULT_COUNTRY || '').replace(/\D/g, ''),
   // Minimum gap between two outgoing messages, in milliseconds.

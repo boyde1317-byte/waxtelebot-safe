@@ -1,6 +1,5 @@
 // Chat-level actions: the things WhatsApp's in-chat menu does, driven from Telegram.
 const config = require('../config');
-const session = require('./session');
 const { toJid, jidLabel } = require('./jid');
 
 function target(rawJid, defaultCountry) {
@@ -16,45 +15,45 @@ function muteEnd(durationMs) {
   return seconds;
 }
 
-async function setMute(rawJid, durationMs, defaultCountry) {
+async function setMute(account, rawJid, durationMs, defaultCountry) {
   const jid = target(rawJid, defaultCountry);
-  await session.requireSocket().chatModify({ mute: muteEnd(durationMs) }, jid);
+  await account.requireSocket().chatModify({ mute: muteEnd(durationMs) }, jid);
   return jid;
 }
 
-async function setPin(rawJid, pinned, defaultCountry) {
+async function setPin(account, rawJid, pinned, defaultCountry) {
   const jid = target(rawJid, defaultCountry);
-  await session.requireSocket().chatModify({ pin: Boolean(pinned) }, jid);
+  await account.requireSocket().chatModify({ pin: Boolean(pinned) }, jid);
   return jid;
 }
 
-async function setArchive(rawJid, archived, defaultCountry) {
+async function setArchive(account, rawJid, archived, defaultCountry) {
   const jid = target(rawJid, defaultCountry);
-  await session.requireSocket().chatModify({ archive: Boolean(archived), lastMessages: [] }, jid);
+  await account.requireSocket().chatModify({ archive: Boolean(archived), lastMessages: [] }, jid);
   return jid;
 }
 
-async function markRead(rawJid, defaultCountry) {
+async function markRead(account, rawJid, defaultCountry) {
   const jid = target(rawJid, defaultCountry);
-  await session.requireSocket().chatModify({ markRead: true, lastMessages: [] }, jid);
+  await account.requireSocket().chatModify({ markRead: true, lastMessages: [] }, jid);
   return jid;
 }
 
-async function clearChat(rawJid, defaultCountry) {
+async function clearChat(account, rawJid, defaultCountry) {
   const jid = target(rawJid, defaultCountry);
-  await session.requireSocket().chatModify({ clear: true, lastMessages: [] }, jid);
+  await account.requireSocket().chatModify({ clear: true, lastMessages: [] }, jid);
   return jid;
 }
 
-async function deleteChat(rawJid, defaultCountry) {
+async function deleteChat(account, rawJid, defaultCountry) {
   const jid = target(rawJid, defaultCountry);
-  await session.requireSocket().chatModify({ delete: true, lastMessages: [] }, jid);
+  await account.requireSocket().chatModify({ delete: true, lastMessages: [] }, jid);
   return jid;
 }
 
-async function setBlocked(rawJid, blocked, defaultCountry) {
+async function setBlocked(account, rawJid, blocked, defaultCountry) {
   const jid = target(rawJid, defaultCountry);
-  await session.requireSocket().updateBlockStatus(jid, blocked ? 'block' : 'unblock');
+  await account.requireSocket().updateBlockStatus(jid, blocked ? 'block' : 'unblock');
   return jid;
 }
 
@@ -108,8 +107,8 @@ function buildSpamIq(entry, { flow, subject = null } = {}) {
   };
 }
 
-async function reportMessage(entry, { block = false, flow = null, subject = null } = {}) {
-  const sock = session.requireSocket();
+async function reportMessage(account, entry, { block = false, flow = null, subject = null } = {}) {
+  const sock = account.requireSocket();
   if (!entry?.id) throw new Error('There is no message to report.');
 
   const node = buildSpamIq(entry, { flow, subject });
@@ -127,8 +126,8 @@ async function reportMessage(entry, { block = false, flow = null, subject = null
   return { jid: entry.jid, status, reportId, blocked, flow: node.content[0].attrs.spam_flow };
 }
 
-async function contactInfo(rawJid, defaultCountry) {
-  const sock = session.requireSocket();
+async function contactInfo(account, rawJid, defaultCountry) {
+  const sock = account.requireSocket();
   const jid = target(rawJid, defaultCountry);
   const info = { jid, label: jidLabel(jid), exists: null, about: null, picture: null };
 
@@ -145,16 +144,16 @@ async function contactInfo(rawJid, defaultCountry) {
   return info;
 }
 
-async function groupInvite(rawJid, defaultCountry) {
+async function groupInvite(account, rawJid, defaultCountry) {
   const jid = target(rawJid, defaultCountry);
-  const code = await session.requireSocket().groupInviteCode(jid);
+  const code = await account.requireSocket().groupInviteCode(jid);
   if (!code) throw new Error('WhatsApp did not return an invite link for that group.');
   return { jid, link: `https://chat.whatsapp.com/${code}` };
 }
 
-async function groupMembers(rawJid, limit = 30, defaultCountry) {
+async function groupMembers(account, rawJid, limit = 30, defaultCountry) {
   const jid = target(rawJid, defaultCountry);
-  const meta = await session.requireSocket().groupMetadata(jid);
+  const meta = await account.requireSocket().groupMetadata(jid);
   const members = (meta?.participants || []).map(p => ({
     jid: jidLabel(p.id),
     admin: p.admin === 'admin' || p.admin === 'superadmin',
@@ -167,9 +166,9 @@ async function groupMembers(rawJid, limit = 30, defaultCountry) {
   };
 }
 
-async function leaveGroup(rawJid, defaultCountry) {
+async function leaveGroup(account, rawJid, defaultCountry) {
   const jid = target(rawJid, defaultCountry);
-  await session.requireSocket().groupLeave(jid);
+  await account.requireSocket().groupLeave(jid);
   return jid;
 }
 

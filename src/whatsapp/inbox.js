@@ -1,7 +1,6 @@
 // Recent inbound media, so pictures received on WhatsApp can be saved from Telegram.
 const config = require('../config');
 const log = require('../utils/logger');
-const session = require('./session');
 const { jidLabel } = require('./jid');
 
 const MEDIA_TYPES = [
@@ -40,17 +39,27 @@ function innerMessage(message) {
   return message;
 }
 
-function record(raw) {
+function record(raw, account = null) {
   const type = mediaTypeOf(raw?.message);
   const text = textOf(raw?.message);
   const kind = type ? 'media' : text ? 'text' : null;
   if (!kind || !raw?.key?.id || !raw.key.remoteJid) return;
   const id = raw.key.id;
+  const inner = innerMessage(raw.message);
+  const isGroup = String(raw.key.remoteJid).endsWith('@g.us');
   entries.set(id, {
     kind,
     text,
     id,
+    inner,
+    accountId: account?.id ?? null,
+    accountLabel: account?.label || null,
     jid: raw.key.remoteJid,
+    isGroup,
+    // Who sent it, in the shape a spam report needs.
+    fromJid: isGroup ? (raw.key.participant || null) : (raw.key.fromMe ? null : raw.key.remoteJid),
+    participant: raw.key.participant || null,
+    mediaType: type ? type.replace('Message', '').toLowerCase() : null,
     type,
     fromMe: Boolean(raw.key.fromMe),
     at: Number(raw.messageTimestamp || 0) * 1000 || Date.now(),
@@ -67,11 +76,12 @@ function record(raw) {
   }
 }
 
-function list({ jid = null, kind = null, limit = 8 } = {}) {
+function list({ accountId = null, jid = null, kind = null, limit = 8 } = {}) {
   const out = [];
   for (let i = order.length - 1; i >= 0 && out.length < limit; i -= 1) {
     const entry = entries.get(order[i]);
     if (!entry) continue;
+    if (accountId !== null && entry.accountId !== accountId) continue;
     if (jid && entry.jid !== jid) continue;
     if (kind && entry.kind !== kind) continue;
     out.push(entry);
@@ -80,8 +90,8 @@ function list({ jid = null, kind = null, limit = 8 } = {}) {
 }
 
 // Newest indexed text from a chat, so it can be copied from Telegram.
-function lastText(jid) {
-  const [entry] = list({ jid, kind: 'text', limit: 1 });
+function lastText(jid, accountId = null) {
+  const [entry] = list({ accountId, jid, kind: 'text', limit: 1 });
   return entry ? { text: entry.text, sender: entry.sender, at: entry.at } : null;
 }
 
@@ -100,7 +110,11 @@ function label(entry) {
 async function download(id) {
   const entry = entries.get(id);
   if (!entry) throw new Error('That media is no longer in the recent list.');
-  session.requireSocket();
+  // Lazy require: the account registry imports this module.
+  const accounts = require('./accounts');
+  const account = entry.accountId === null ? null : accounts.get(entry.accountId);
+  if (!account) throw new Error('That media belongs to an account that is no longer linked.');
+  account.requireSocket();
   const { downloadMediaMessage } = await import('baileys');
   const buffer = await downloadMediaMessage(entry.message, 'buffer', {}, {
     logger: log,

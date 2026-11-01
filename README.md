@@ -21,8 +21,9 @@ Users: `/start`, `/feedback <message>`, `/feedback`, `/myfeedback`, `/cancel`, `
 
 Admins: `/inbox [page]`, `/reply <id> <message>`, `/resolve <id>`, `/adminstats`, `/adminhelp`
 
-WhatsApp (admins): `/wa` for the button menu, `/pair <number>`, `/send <number|group-id> <text>`,
-`/chat <number|group>`, `/groups`, `/media`, `/unpair`, `/cancelwa`
+WhatsApp (admins): `/wa` for the button menu, `/accounts` to list them, `/account <n>` to switch,
+`/pair <number>`, `/send <number|group-id> <text>`, `/chat <number|group>`, `/groups`, `/media`,
+`/unpair`, `/cancelwa`
 
 ## Behaviour
 
@@ -44,6 +45,21 @@ Pairing is by phone number, not QR:
 3. On the phone holding that account: Settings → Linked devices → Link a device → Link with phone number instead, then type the code.
 
 The session is saved to `WA_AUTH_DIR`, so the bot reconnects on its own after a restart. `/unpair` logs out and deletes it.
+
+### Several accounts at once
+
+Each linked account is its own Baileys socket with its own auth folder under `WA_ACCOUNTS_DIR`, its own send budget,
+and its own recent-message index. `/pair <number>` adds one (up to `WA_MAX_ACCOUNTS`, default 4), the menu lists them
+with a ✓ when connected, and tapping one makes it active. Every action after that — sending, chat actions, groups,
+media — applies to the active account only, and replies say which one acted.
+
+`/unpair` removes just the active account: it logs out, deletes that folder, and the others keep running. Boot
+reconnects them one at a time (`WA_RESTORE_GAP_MS`) so the handshakes do not collide. An install that was paired
+before accounts existed keeps its session: the old `WA_AUTH_DIR` folder is adopted as the first account.
+
+Two honest notes. The send cap is per account, so four accounts together reach four times the volume — do not read
+that as permission to broadcast, since identical blasts from several numbers on one connection look exactly like bulk
+messaging to WhatsApp. And each account is one linked device; WhatsApp allows four linked devices per account.
 
 ### Chat actions
 

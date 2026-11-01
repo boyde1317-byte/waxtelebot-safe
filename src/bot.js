@@ -5,8 +5,7 @@ const log = require('./utils/logger');
 const whatsappHandler = require('./handlers/whatsapp');
 const startHandler = require('./handlers/start');
 const adminHandler = require('./handlers/admin');
-const wa = require('./whatsapp/session');
-const waInbox = require('./whatsapp/inbox');
+const accounts = require('./whatsapp/accounts');
 
 if (!config.botToken) throw new Error('Missing BOT_TOKEN. Copy .env.example to .env and set BOT_TOKEN.');
 
@@ -31,15 +30,19 @@ async function main() {
   await bot.launch({ dropPendingUpdates: false });
   log.info('Bot is live.');
   if (config.waEnabled) {
-    waInbox.attach();
-    wa.restore().then(status => log.info('WhatsApp: %s', status.connected ? `connected as +${status.number}` : status.state));
+    accounts.init();
+    accounts.restoreAll().then(rows => {
+      const connected = rows.filter(row => row.status.connected).map(row => `+${row.status.number || '?'}`);
+      log.info('WhatsApp: %d account(s) linked, %d connected%s',
+        rows.length, connected.length, connected.length ? ` (${connected.join(', ')})` : '');
+    });
   }
 }
 
 function shutdown(signal) {
   log.info('%s received; shutting down', signal);
   bot.stop(signal);
-  wa.stop().catch(() => {}).finally(() => db.db.close());
+  accounts.stopAll().catch(() => {}).finally(() => db.db.close());
 }
 
 process.once('SIGINT', () => shutdown('SIGINT'));
