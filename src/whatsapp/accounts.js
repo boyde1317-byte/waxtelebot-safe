@@ -101,6 +101,14 @@ function list() {
   });
 }
 
+// A number can only hold one session here: pairing it twice adds a second
+// linked device to the same account instead of a separate account.
+function phoneClash(phone, exceptId = null) {
+  if (!phone) return null;
+  const hit = list().find(row => row.phone === phone && row.id !== Number(exceptId) && row.status.hasCreds);
+  return hit || null;
+}
+
 function get(id) {
   return sessions.get(Number(id)) || null;
 }
@@ -137,5 +145,5 @@ function summaryLine(adminId) {
 
 module.exports = {
   init, restoreAll, subscribeAll, create, remove, list, get, active, setActive, stopAll,
-  summaryLine, newAccountDir,
+  summaryLine, newAccountDir, phoneClash,
 };

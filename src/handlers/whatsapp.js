@@ -6,7 +6,7 @@ const log = require('../utils/logger');
 const accounts = require('../whatsapp/accounts');
 const chat = require('../whatsapp/chat');
 const inbox = require('../whatsapp/inbox');
-const { toJid, jidLabel } = require('../whatsapp/jid');
+const { toJid, toPhoneDigits, jidLabel } = require('../whatsapp/jid');
 
 const pendingInput = new Map(); // adminId -> { step, jid }
 const activeChat = new Map(); // adminId -> jid the chat buttons act on
@@ -188,6 +188,22 @@ function unpairedAccount() {
 }
 
 async function beginPairing(ctx, phone) {
+  const digits = toPhoneDigits(phone, config.waDefaultCountry);
+  if (!digits) {
+    return ctx.reply('That does not look like a phone number. Include the country code, e.g. +233241234567.');
+  }
+  const clash = accounts.phoneClash(digits);
+  if (clash) {
+    return ctx.reply(
+      [
+        `+${digits} is already paired as ${clash.label}.`,
+        '',
+        'One number is one session. Pairing it again would add a second linked device to the same WhatsApp account, not a new account.',
+        `Switch to it with /account ${clash.id}, or unpair it first if you want to start over.`,
+      ].join('\n')
+    );
+  }
+
   let session;
   try {
     session = unpairedAccount() || accounts.create();

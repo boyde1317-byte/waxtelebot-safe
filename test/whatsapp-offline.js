@@ -70,6 +70,18 @@ const GROUP = '120363000000000000@g.us';
   assert.match(accounts.summaryLine(42), /Work/);
   accounts.setActive(42, first.id);
 
+  // --- one number is one session ---------------------------------------
+  const fs = require('fs');
+  const pathModule = require('path');
+  const credsDir = first.status().authDir;
+  fs.mkdirSync(credsDir, { recursive: true });
+  fs.writeFileSync(pathModule.join(credsDir, 'creds.json'), '{}');
+  db.updateAccount(first.id, { phone: '233241234567' });
+  assert.strictEqual(accounts.phoneClash('233241234567').id, first.id, 'a paired number is recognised');
+  assert.strictEqual(accounts.phoneClash('233241234567', first.id), null, 'an account is not a clash with itself');
+  assert.strictEqual(accounts.phoneClash('233249999999'), null);
+  assert.strictEqual(accounts.phoneClash(null), null);
+
   // --- menu wiring ------------------------------------------------------
   const handler = require('../src/handlers/whatsapp');
   const menu = handler.menuKeyboard(42).reply_markup.inline_keyboard.flat();

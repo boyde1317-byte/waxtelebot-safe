@@ -53,6 +53,14 @@ and its own recent-message index. `/pair <number>` adds one (up to `WA_MAX_ACCOU
 with a ✓ when connected, and tapping one makes it active. Every action after that — sending, chat actions, groups,
 media — applies to the active account only, and replies say which one acted.
 
+One number is one session. Pairing a number that is already paired is refused rather than allowed, because WhatsApp
+would happily add a *second linked device* to that same account instead of giving you a second account — which is the
+arrangement this is meant to avoid. Use `/account <n>` to switch to the existing session, or unpair it first.
+
+These are separate Baileys sessions, not devices on one account: one `makeWASocket` per account, its own
+`creds.json` under its own folder, its own keys and reconnect state. Two sessions never share credentials, which is
+also why they cannot interfere with each other.
+
 `/unpair` removes just the active account: it logs out, deletes that folder, and the others keep running. Boot
 reconnects them one at a time (`WA_RESTORE_GAP_MS`) so the handshakes do not collide. An install that was paired
 before accounts existed keeps its session: the old `WA_AUTH_DIR` folder is adopted as the first account.
