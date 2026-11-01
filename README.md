@@ -49,8 +49,8 @@ The session is saved to `WA_AUTH_DIR`, so the bot reconnects on its own after a 
 ### Several accounts at once
 
 Each linked account is its own Baileys socket with its own auth folder under `WA_ACCOUNTS_DIR`, its own send budget,
-and its own recent-message index. `/pair <number>` adds one (up to `WA_MAX_ACCOUNTS`, default 4), the menu lists them
-with a ✓ when connected, and tapping one makes it active. Every action after that — sending, chat actions, groups,
+and its own recent-message index. `/pair <number>` adds one (up to `WA_MAX_ACCOUNTS`, default 50), the menu lists them six per page with a ✓ when
+connected, and tapping one makes it active. Every action after that — sending, chat actions, groups,
 media — applies to the active account only, and replies say which one acted.
 
 One number is one session. Pairing a number that is already paired is refused rather than allowed, because WhatsApp
@@ -65,9 +65,21 @@ also why they cannot interfere with each other.
 reconnects them one at a time (`WA_RESTORE_GAP_MS`) so the handshakes do not collide. An install that was paired
 before accounts existed keeps its session: the old `WA_AUTH_DIR` folder is adopted as the first account.
 
-Two honest notes. The send cap is per account, so four accounts together reach four times the volume — do not read
-that as permission to broadcast, since identical blasts from several numbers on one connection look exactly like bulk
-messaging to WhatsApp. And each account is one linked device; WhatsApp allows four linked devices per account.
+### How many sessions fit
+
+Baileys has no session limit: a "session" is just a socket plus an auth folder, so the ceiling is the host, not the
+library. The WhatsApp rule people confuse with it — four linked devices — applies **per number**, so it caps nothing
+here: each account adds one device to its own account.
+
+What actually runs out is memory and boot time. Budget roughly 40-80MB per live session, so ten accounts is a few
+hundred MB and fifty wants 2-4GB. Reconnects are staggered by `WA_RESTORE_GAP_MS`, one at a time, because fifty
+simultaneous handshakes on boot is how a fleet gets rate-limited. Raise `WA_MAX_ACCOUNTS` (capped at 50) once the
+host has the RAM for it.
+
+The send cap is per account, so fifty accounts reach fifty times the volume — not permission to broadcast, since
+identical blasts from many numbers on one connection look exactly like bulk messaging to WhatsApp. Sending different
+things to different people from different accounts is the sane use, and each session has its own log rows so you can
+see which one did what.
 
 ### Chat actions
 

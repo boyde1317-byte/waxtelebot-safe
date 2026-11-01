@@ -31,6 +31,10 @@ async function main() {
   log.info('Bot is live.');
   if (config.waEnabled) {
     accounts.init();
+    const linked = accounts.list().length;
+    if (linked >= 10) {
+      log.info('WhatsApp fleet of %d: each live session holds its own socket and key store, roughly 40-80MB each.', linked);
+    }
     accounts.restoreAll().then(rows => {
       const connected = rows.filter(row => row.status.connected).map(row => `+${row.status.number || '?'}`);
       log.info('WhatsApp: %d account(s) linked, %d connected%s',

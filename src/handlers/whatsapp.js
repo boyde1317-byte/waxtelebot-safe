@@ -43,10 +43,19 @@ function statusLine(session) {
   return bits.join(' · ');
 }
 
-function accountButtons(adminId) {
+const ACCOUNTS_PER_PAGE = 6;
+
+function pageCount(total) {
+  return Math.max(1, Math.ceil(total / ACCOUNTS_PER_PAGE));
+}
+
+function accountButtons(adminId, page = 0) {
   const rows = accounts.list();
   const current = accounts.active(adminId);
-  const buttons = rows.map(row => {
+  const pages = pageCount(rows.length);
+  const safePage = Math.min(Math.max(0, page), pages - 1);
+  const visible = rows.slice(safePage * ACCOUNTS_PER_PAGE, (safePage + 1) * ACCOUNTS_PER_PAGE);
+  const buttons = visible.map(row => {
     const mark = row.status.connected ? '✓' : '·';
     const me = current && current.id === row.id ? '▸' : '';
     return {
@@ -56,11 +65,18 @@ function accountButtons(adminId) {
   });
   const lines = [];
   for (let i = 0; i < buttons.length; i += 2) lines.push(buttons.slice(i, i + 2));
+  if (pages > 1) {
+    lines.push([
+      { text: '‹', callback_data: `wa:acctpage:${(safePage + pages - 1) % pages}` },
+      { text: `${safePage + 1}/${pages}`, callback_data: 'wa:noop' },
+      { text: '›', callback_data: `wa:acctpage:${(safePage + 1) % pages}` },
+    ]);
+  }
   lines.push([{ text: '+ Add account', callback_data: 'wa:add' }]);
   return lines;
 }
 
-function menuText(adminId) {
+function menuText(adminId, page = 0) {
   const rows = accounts.list();
   const current = accounts.active(adminId);
   const head = ['WhatsApp'];
@@ -68,14 +84,16 @@ function menuText(adminId) {
     head.push('No accounts linked yet.');
   } else {
     const connected = rows.filter(row => row.status.connected).length;
+    const pages = pageCount(rows.length);
+    const pageNote = pages > 1 ? ` · page ${Math.min(page, pages - 1) + 1}/${pages}` : '';
     head.push(`Active: ${current ? accountTag({ label: current.snapshot.label, status: { number: current.snapshot.number } }) : 'none'}`);
-    head.push(`Accounts: ${rows.length} linked, ${connected} connected`);
+    head.push(`Accounts: ${rows.length}/${config.waMaxAccounts} linked, ${connected} connected${pageNote}`);
   }
   head.push('', 'Commands: /pair <number> · /send <target> <text> · /chat <target> · /groups · /media · /accounts · /unpair · /cancelwa');
   return head.join('\n');
 }
 
-function menuKeyboard(adminId) {
+function menuKeyboard(adminId, page = 0) {
   const rows = accounts.list();
   if (!rows.length) {
     return { reply_markup: { inline_keyboard: [[{ text: '+ Add account', callback_data: 'wa:add' }]] } };
@@ -83,7 +101,7 @@ function menuKeyboard(adminId) {
   return {
     reply_markup: {
       inline_keyboard: [
-        ...accountButtons(adminId),
+        ...accountButtons(adminId, page),
         [
           { text: 'Send a message', callback_data: 'wa:send' },
           { text: 'Save media', callback_data: 'wa:media' },
@@ -407,9 +425,9 @@ function register(bot) {
     if (type === 'reconnectFailed') notifyAdmins(`${label} could not reconnect. Use /accounts to check it.`);
   });
 
-  const showMenu = async ctx => {
-    const { reply_markup } = menuKeyboard(ctx.from.id);
-    return ctx.reply(menuText(ctx.from.id), { reply_markup });
+  const showMenu = async (ctx, page = 0) => {
+    const { reply_markup } = menuKeyboard(ctx.from.id, page);
+    return ctx.reply(menuText(ctx.from.id, page), { reply_markup });
   };
 
   // --- commands -----------------------------------------------------------
@@ -424,7 +442,20 @@ function register(bot) {
     if (!rows.length) return showMenu(ctx);
     const current = accounts.active(ctx.from.id);
     const lines = rows.map(row => `${current && current.id === row.id ? '▸' : ' '} ${row.label}${row.phone ? ` +${row.phone}` : ''} · ${statusLine(accounts.get(row.id))}`);
-    return ctx.reply(`WhatsApp accounts:\n${lines.join('\n')}`, { reply_markup: menuKeyboard(ctx.from.id).reply_markup });
+    const connected = rows.filter(row => row.status.connected).length;
+    // Telegram messages cap at 4096 characters, so a big fleet arrives in parts.
+    const chunks = [];
+    let buffer = `WhatsApp accounts (${rows.length}/${config.waMaxAccounts} linked, ${connected} connected):`;
+    for (const line of lines) {
+      if (buffer.length + line.length + 1 > 3500) {
+        chunks.push(buffer);
+        buffer = '';
+      }
+      buffer += `\n${line}`;
+    }
+    chunks.push(buffer);
+    for (const chunk of chunks) await ctx.reply(chunk);
+    return ctx.reply(`Active: ${current ? accountTag({ label: current.snapshot.label, status: { number: current.snapshot.number } }) : 'none'}`, menuKeyboard(ctx.from.id));
   });
 
   bot.command('account', async ctx => {
@@ -506,9 +537,24 @@ function register(bot) {
   // --- menu buttons -------------------------------------------------------
   bot.action('wa:menu', async ctx => {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
-    const { reply_markup } = menuKeyboard(ctx.from.id);
-    await ctx.editMessageText(menuText(ctx.from.id), { reply_markup }).catch(() => ctx.reply(menuText(ctx.from.id), { reply_markup }));
+    const page = Number(ctx.match?.[1] || 0) || 0;
+    const { reply_markup } = menuKeyboard(ctx.from.id, page);
+    await ctx.editMessageText(menuText(ctx.from.id, page), { reply_markup })
+      .catch(() => ctx.reply(menuText(ctx.from.id, page), { reply_markup }));
     return ctx.answerCbQuery();
+  });
+
+  bot.action(/^wa:acctpage:(\d+)$/, async ctx => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
+    const page = Number(ctx.match[1]) || 0;
+    await ctx.answerCbQuery();
+    const { reply_markup } = menuKeyboard(ctx.from.id, page);
+    return ctx.reply(menuText(ctx.from.id, page), { reply_markup });
+  });
+
+  bot.action('wa:noop', async ctx => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery();
+    return ctx.answerCbQuery('Use ‹ › to page through accounts.');
   });
 
   bot.action(/^wa:acct:(\d+)$/, async ctx => {
@@ -521,8 +567,10 @@ function register(bot) {
     const session = accounts.get(id);
     activeChat.delete(ctx.from.id);
     await ctx.answerCbQuery(`Switched to ${session.snapshot.label}`);
-    const { reply_markup } = menuKeyboard(ctx.from.id);
-    return ctx.reply(menuText(ctx.from.id), { reply_markup }).catch(() => undefined);
+    const index = accounts.list().findIndex(row => row.id === id);
+    const page = index < 0 ? 0 : Math.floor(index / ACCOUNTS_PER_PAGE);
+    const { reply_markup } = menuKeyboard(ctx.from.id, page);
+    return ctx.reply(menuText(ctx.from.id, page), { reply_markup }).catch(() => undefined);
   });
 
   bot.action('wa:add', async ctx => {

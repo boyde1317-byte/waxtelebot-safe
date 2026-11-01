@@ -3,7 +3,7 @@ process.env.DB_PATH = '/tmp/waxtele-wa-offline.db';
 process.env.ADMIN_IDS = '42';
 process.env.WA_ENABLED = '1';
 process.env.WA_DEFAULT_COUNTRY = '233';
-process.env.WA_MAX_ACCOUNTS = '2';
+process.env.WA_MAX_ACCOUNTS = '12';
 process.env.WA_SEND_HOURLY_CAP = '2';
 process.env.WA_SEND_MIN_INTERVAL_MS = '0';
 process.env.WA_ACCOUNTS_DIR = '/tmp/waxtele-accounts-test';
@@ -57,7 +57,12 @@ const GROUP = '120363000000000000@g.us';
   assert.ok(first.status().authDir.includes('account-'), 'folders live under the accounts directory');
   assert.match(first.snapshot.label, /Account 1/);
   assert.strictEqual(second.snapshot.label, 'Work');
-  assert.throws(() => accounts.create(), /limit/i, 'the roster is capped');
+  // a real fleet: eight accounts, paged six at a time in the menu
+  const extras = [];
+  for (let i = 0; i < 6; i += 1) extras.push(accounts.create(`Fleet ${i + 3}`));
+  assert.strictEqual(accounts.list().length, 8);
+
+
   assert.strictEqual(accounts.get(first.id).id, first.id);
   assert.strictEqual(accounts.get(999), null);
 
@@ -86,9 +91,18 @@ const GROUP = '120363000000000000@g.us';
   const handler = require('../src/handlers/whatsapp');
   const menu = handler.menuKeyboard(42).reply_markup.inline_keyboard.flat();
   const menuText = handler.menuText(42);
-  assert.match(menuText, /Accounts: 2 linked/);
+  assert.match(menuText, /Accounts: 8\/12 linked/);
   assert.ok(menu.some(b => b.callback_data === `wa:acct:${first.id}`), 'each account has a switch button');
   assert.ok(menu.some(b => b.callback_data === `wa:acct:${second.id}`));
+  const page0 = handler.menuKeyboard(42, 0).reply_markup.inline_keyboard.flat().map(b => b.callback_data);
+  const page1 = handler.menuKeyboard(42, 1).reply_markup.inline_keyboard.flat().map(b => b.callback_data);
+  assert.strictEqual(page0.filter(cb => cb.startsWith('wa:acct:') && !cb.startsWith('wa:acctpage')).length, 6, 'six accounts per page');
+  assert.ok(page0.includes('wa:acctpage:1'), 'a next arrow appears');
+  assert.strictEqual(page1.filter(cb => cb.startsWith('wa:acct:') && !cb.startsWith('wa:acctpage')).length, 2, 'the rest are on page two');
+  assert.ok(page1.includes('wa:acctpage:0'), 'and a back arrow');
+  assert.match(handler.menuText(42, 1), /page 2\/2/);
+  assert.ok(handler.menuText(42, 9).includes('page 2/2'), 'an out-of-range page is clamped');
+
   assert.ok(menu.some(b => b.callback_data === 'wa:add'));
   for (const button of menu) {
     assert.ok(button.text && button.callback_data, 'every button has text and an action');
@@ -105,6 +119,8 @@ const GROUP = '120363000000000000@g.us';
   for (const button of [...chatButtons, ...groupButtons]) {
     assert.ok(Buffer.byteLength(button.callback_data) <= 64, `callback_data too long: ${button.callback_data}`);
   }
+  while (accounts.list().length < 12) accounts.create();
+  assert.throws(() => accounts.create(), /limit/i, 'the roster is capped');
   assert.strictEqual(typeof handler.MUTE_OPTIONS.mute8.ms, 'number');
   assert.strictEqual(handler.MUTE_OPTIONS.unmute.ms, null);
 
@@ -329,7 +345,9 @@ const GROUP = '120363000000000000@g.us';
   // --- removing one account leaves the other alone ----------------------
   await accounts.remove(second.id);
   await assert.rejects(() => inbox.download('EPH1'), /no longer linked/i, 'media from a removed account cannot be fetched');
-  assert.deepStrictEqual(accounts.list().map(row => row.id), [first.id]);
+  const remaining = accounts.list().map(row => row.id);
+  assert.ok(remaining.includes(first.id), 'the other accounts stay');
+  assert.ok(!remaining.includes(second.id), 'only the removed account is gone');
   assert.strictEqual(accounts.get(second.id), null);
   assert.strictEqual(accounts.active(42).id, first.id, 'the active account falls back to a live one');
 

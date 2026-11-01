@@ -42,8 +42,10 @@ module.exports = {
   waAuthDir: process.env.WA_AUTH_DIR || path.join(__dirname, '..', 'data', 'wa-auth'),
   // One auth folder per linked account lives under here.
   waAccountsDir: process.env.WA_ACCOUNTS_DIR || path.join(__dirname, '..', 'data', 'wa-accounts'),
-  // How many WhatsApp accounts one bot can drive.
-  waMaxAccounts: parsePositiveInt(process.env.WA_MAX_ACCOUNTS, 4),
+  // How many WhatsApp accounts one bot can drive. Baileys itself sets no
+  // limit; the real ceiling is RAM (roughly 40-80MB per live socket) and the
+  // 4-linked-device rule, which applies per number, not per process.
+  waMaxAccounts: Math.min(parsePositiveInt(process.env.WA_MAX_ACCOUNTS, 50), 50),
   // Gap between reconnects on boot so the handshakes do not collide.
   waRestoreGapMs: parseNonNegativeInt(process.env.WA_RESTORE_GAP_MS, 1500),
   // Country code applied to local numbers written without one, e.g. 233.
