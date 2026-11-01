@@ -24,6 +24,21 @@ CREATE TABLE IF NOT EXISTS feedback (
 );
 CREATE INDEX IF NOT EXISTS idx_feedback_status ON feedback(status);
 CREATE INDEX IF NOT EXISTS idx_feedback_user ON feedback(user_id, id);
+CREATE TABLE IF NOT EXISTS wa_sends (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  admin_id INTEGER,
+  jid TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'text',
+  body_preview TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'sent',
+  error TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wa_sends_created ON wa_sends(created_at DESC);
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 `);
 
 // Additive migrations so an existing feedback.db keeps working.
@@ -60,7 +75,40 @@ const replyFeedbackStatement = db.prepare(`UPDATE feedback SET status='resolved'
 function replyFeedback(id, replyText, adminId = null) {
   return replyFeedbackStatement.run(new Date().toISOString(), String(replyText), adminId, id).changes > 0;
 }
+// --- WhatsApp send log -----------------------------------------------------
+const PREVIEW_LIMIT = 120;
+const insertSend = db.prepare(`INSERT INTO wa_sends (admin_id, jid, kind, body_preview, status, error, created_at)
+  VALUES (@admin_id, @jid, @kind, @body_preview, @status, @error, @created_at)`);
+function logSend({ adminId = null, jid, kind = 'text', body = '', status = 'sent', error = null }) {
+  const preview = String(body).replace(/\s+/g, ' ').trim().slice(0, PREVIEW_LIMIT);
+  const result = insertSend.run({
+    admin_id: adminId,
+    jid: String(jid),
+    kind,
+    body_preview: preview,
+    status,
+    error: error ? String(error).slice(0, 300) : null,
+    created_at: new Date().toISOString(),
+  });
+  return result.lastInsertRowid;
+}
+const recentSends = db.prepare('SELECT * FROM wa_sends ORDER BY id DESC LIMIT ?');
+function listSends(limit = 10) { return recentSends.all(limit); }
+
+// --- key/value settings ----------------------------------------------------
+const readSetting = db.prepare('SELECT value FROM settings WHERE key = ?');
+function getSetting(key, fallback = null) {
+  const row = readSetting.get(key);
+  return row ? row.value : fallback;
+}
+const writeSetting = db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value');
+function setSetting(key, value) { writeSetting.run(key, String(value)); }
+
 const counts = db.prepare(`SELECT COUNT(*) AS total, SUM(status='open') AS open FROM feedback`);
 function feedbackCounts() { const row = counts.get(); return { total: row.total, open: row.open || 0 }; }
 
-module.exports = { db, upsertUser, createFeedback, getFeedback, listOpenFeedback, listUserFeedback, resolveFeedback, replyFeedback, feedbackCounts };
+module.exports = {
+  db, upsertUser, createFeedback, getFeedback, listOpenFeedback, listUserFeedback,
+  resolveFeedback, replyFeedback, feedbackCounts,
+  logSend, listSends, getSetting, setSetting,
+};

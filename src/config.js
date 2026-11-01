@@ -33,4 +33,18 @@ module.exports = {
   pendingTtlSeconds: parsePositiveInt(process.env.PENDING_TTL_SECONDS, 300),
   // Feedback items per /inbox page.
   inboxPageSize: parsePositiveInt(process.env.INBOX_PAGE_SIZE, 10),
+
+  // --- WhatsApp (Baileys) --------------------------------------------------
+  // Set WA_ENABLED=0 to run as a pure feedback bot.
+  waEnabled: String(process.env.WA_ENABLED ?? '1') !== '0',
+  // Where the paired session (creds.json) is stored. Keep this out of git.
+  waAuthDir: process.env.WA_AUTH_DIR || path.join(__dirname, '..', 'data', 'wa-auth'),
+  // Country code applied to local numbers written without one, e.g. 233.
+  waDefaultCountry: String(process.env.WA_DEFAULT_COUNTRY || '').replace(/\D/g, ''),
+  // Minimum gap between two outgoing messages, in milliseconds.
+  waSendMinIntervalMs: parseNonNegativeInt(process.env.WA_SEND_MIN_INTERVAL_MS, 1500),
+  // Hard cap on outgoing messages per rolling hour, a brake against account bans.
+  waSendHourlyCap: parsePositiveInt(process.env.WA_SEND_HOURLY_CAP, 30),
+  // Groups listed by /groups.
+  waGroupListLimit: parsePositiveInt(process.env.WA_GROUP_LIST_LIMIT, 20),
 };

@@ -2,15 +2,17 @@
   "name": "telegram-feedback-bot",
   "version": "1.0.0",
   "private": true,
-  "description": "Telegram feedback intake bot with admin review",
+  "description": "Telegram feedback intake bot with optional WhatsApp (Baileys) pairing and messaging",
   "main": "src/bot.js",
   "scripts": {
     "start": "node src/bot.js",
-    "test": "node test/smoke.js"
+    "test": "node test/smoke.js && node test/whatsapp-offline.js"
   },
   "dependencies": {
+    "baileys": "^7.0.0-rc14",
     "better-sqlite3": "^11.8.1",
     "dotenv": "^16.4.7",
+    "qrcode-terminal": "^0.12.0",
     "telegraf": "^4.16.3"
   }
 }

@@ -2,8 +2,10 @@ const { Telegraf } = require('telegraf');
 const config = require('./config');
 const db = require('./db');
 const log = require('./utils/logger');
+const whatsappHandler = require('./handlers/whatsapp');
 const startHandler = require('./handlers/start');
 const adminHandler = require('./handlers/admin');
+const wa = require('./whatsapp/session');
 
 if (!config.botToken) throw new Error('Missing BOT_TOKEN. Copy .env.example to .env and set BOT_TOKEN.');
 
@@ -17,6 +19,8 @@ bot.use(async (ctx, next) => {
     await ctx.reply('The bot could not process that request.').catch(() => {});
   }
 });
+// WhatsApp controls register first so their staged text input wins over the feedback prompt.
+whatsappHandler.register(bot);
 startHandler.register(bot);
 adminHandler.register(bot);
 bot.on('message', ctx => ctx.reply('Use /help to see available commands.'));
@@ -25,12 +29,15 @@ async function main() {
   log.info('Starting feedback bot; admins: %s', config.adminIds.join(', ') || '(none)');
   await bot.launch({ dropPendingUpdates: false });
   log.info('Bot is live.');
+  if (config.waEnabled) {
+    wa.restore().then(status => log.info('WhatsApp: %s', status.connected ? `connected as +${status.number}` : status.state));
+  }
 }
 
 function shutdown(signal) {
   log.info('%s received; shutting down', signal);
   bot.stop(signal);
-  db.db.close();
+  wa.stop().catch(() => {}).finally(() => db.db.close());
 }
 
 process.once('SIGINT', () => shutdown('SIGINT'));
