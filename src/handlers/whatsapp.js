@@ -357,6 +357,26 @@ async function runChatAction(ctx, session, jid, action) {
         }
         reportTarget.set(ctx.from.id, entry.id);
         const preview = (entry.text || '(media without a caption)').slice(0, 160);
+        const pairedCount = accounts.list().filter(a => a.status.hasCreds).length;
+        const inlineKeyboard = [
+          [
+            { text: 'Report', callback_data: 'wacr:solo' },
+            { text: 'Report and block', callback_data: 'wacr:block' },
+          ],
+        ];
+        if (pairedCount > 1) {
+          inlineKeyboard.push([
+            { text: `Report all (${pairedCount} sessions)`, callback_data: 'wacr:all' },
+            { text: 'Report & block all', callback_data: 'wacr:all_block' },
+          ]);
+        } else {
+          inlineKeyboard.push([
+            { text: 'Report (all paired sessions)', callback_data: 'wacr:all' },
+            { text: 'Report & block all', callback_data: 'wacr:all_block' },
+          ]);
+        }
+        inlineKeyboard.push([{ text: 'Cancel', callback_data: 'wacr:cancel' }]);
+
         return ctx.reply(
           [
             `Report this message from ${jidLabel(jid)} to WhatsApp?`,
@@ -367,12 +387,7 @@ async function runChatAction(ctx, session, jid, action) {
           ].join('\n'),
           {
             reply_markup: {
-              inline_keyboard: [[
-                { text: 'Report', callback_data: 'wacr:solo' },
-                { text: 'Report and block', callback_data: 'wacr:block' },
-              ], [
-                { text: 'Cancel', callback_data: 'wacr:cancel' },
-              ]],
+              inline_keyboard: inlineKeyboard,
             },
           }
         );
@@ -524,6 +539,46 @@ function register(bot) {
     const session = sessionFor(ctx);
     if (!session) return;
     return replyMedia(ctx, session);
+  });
+
+  bot.command('reportall', async ctx => {
+    if (!requireAdmin(ctx)) return;
+    const session = sessionFor(ctx);
+    if (!session) return;
+    const targetRaw = ctx.message.text.replace(/^\/reportall\s*/i, '').trim();
+    const jid = targetRaw ? toJid(targetRaw, config.waDefaultCountry) : activeChat.get(ctx.from.id);
+    if (!jid) {
+      return ctx.reply('Usage: /reportall <number|group-id>, or run it while in a chat.');
+    }
+    const [entry] = inbox.list({ accountId: session.id, jid, limit: 1 });
+    if (!entry) {
+      return ctx.reply(`No recent message from ${jidLabel(jid)} on ${session.snapshot.label} to report.`);
+    }
+    reportTarget.set(ctx.from.id, entry.id);
+    const preview = (entry.text || '(media without caption)').slice(0, 160);
+    const pairedCount = accounts.list().filter(a => a.status.hasCreds).length;
+    return ctx.reply(
+      [
+        `Route report for message from ${jidLabel(jid)} across all paired sessions?`,
+        '',
+        `"${preview}"`,
+        '',
+        `Targeting ${pairedCount || 1} paired session(s).`,
+      ].join('\n'),
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: `Route to all (${pairedCount || 1})`, callback_data: 'wacr:all' },
+              { text: 'Route & block all', callback_data: 'wacr:all_block' },
+            ],
+            [
+              { text: 'Cancel', callback_data: 'wacr:cancel' },
+            ],
+          ],
+        },
+      }
+    );
   });
 
   bot.command('cancelwa', ctx => {
@@ -747,25 +802,89 @@ function register(bot) {
       await ctx.answerCbQuery();
       return ctx.reply('That message is no longer in the recent list, so there is nothing to report.');
     }
-    await ctx.answerCbQuery('Reporting…');
+
+    const isAll = choice === 'all' || choice === 'all_block';
+    const doBlock = choice === 'block' || choice === 'all_block';
+
+    if (isAll) {
+      await ctx.answerCbQuery('Routing report across paired sessions…');
+      try {
+        let subject = null;
+        if (entry.isGroup) {
+          subject = await chat.groupMembers(session, entry.jid, 1, config.waDefaultCountry)
+            .then(info => info.subject).catch(() => null);
+        }
+        const pairedRows = accounts.list().filter(a => a.status.hasCreds);
+        const sessionsToRoute = pairedRows.map(r => accounts.get(r.id)).filter(Boolean);
+        if (!sessionsToRoute.length) sessionsToRoute.push(session);
+
+        const results = await chat.reportMessageAll(sessionsToRoute, entry, { block: doBlock, subject });
+        reportTarget.delete(ctx.from.id);
+
+        const lines = [`Report routed through ${results.length} paired session(s):`];
+        for (const r of results) {
+          const iden = r.number ? `${r.label} (${r.number})` : r.label;
+          if (r.status === 'confirmed') {
+            lines.push(`• ${iden}: Confirmed (id ${r.reportId})`);
+          } else if (r.status === 'unconfirmed') {
+            lines.push(`• ${iden}: Answered without report id`);
+          } else if (r.status === 'unanswered') {
+            lines.push(`• ${iden}: Unanswered`);
+          } else if (r.status === 'disconnected') {
+            lines.push(`• ${iden}: Skipped (disconnected)`);
+          } else {
+            lines.push(`• ${iden}: Failed (${r.error})`);
+          }
+        }
+        if (doBlock) lines.push('\nBlock applied across available sessions.');
+        return ctx.reply(lines.join('\n'));
+      } catch (error) {
+        log.warn('Report route failed: %s', error.message);
+        return ctx.reply(`Could not route report: ${error.message}`);
+      }
+    }
+
+    await ctx.answerCbQuery('Reporting and auto-routing to paired sessions…');
     try {
       let subject = null;
       if (entry.isGroup) {
         subject = await chat.groupMembers(session, entry.jid, 1, config.waDefaultCountry)
           .then(info => info.subject).catch(() => null);
       }
-      const result = await chat.reportMessage(session, entry, { block: choice === 'block', subject });
+      const doBlock = choice === 'block' || choice === 'all_block';
+      const { primary, cascaded } = await chat.reportWithAutoCascade(session, entry, { block: doBlock, subject });
       reportTarget.delete(ctx.from.id);
       const lines = [];
-      if (result.status === 'confirmed') {
-        lines.push(`WhatsApp accepted the report (id ${result.reportId}). That is the server acknowledging it, not a promise of removal.`);
-      } else if (result.status === 'unconfirmed') {
-        lines.push('WhatsApp answered without a report id. Treat the report as unconfirmed.');
+      if (primary.status === 'confirmed') {
+        lines.push(`Primary session (${session.snapshot.label}): Accepted (id ${primary.reportId}). That is the server acknowledging it, not a promise of removal.`);
+      } else if (primary.status === 'unconfirmed') {
+        lines.push(`Primary session (${session.snapshot.label}): Answered without a report id. Treat as unconfirmed.`);
       } else {
-        lines.push(`WhatsApp never answered within ${Math.round(config.waQueryTimeoutMs / 1000)}s. The report may not have been accepted.`);
+        lines.push(`Primary session (${session.snapshot.label}): Never answered within ${Math.round(config.waQueryTimeoutMs / 1000)}s.`);
       }
-      lines.push(result.blocked ? `${jidLabel(result.jid)} is blocked.` : 'Not blocked; block with the Block button if you want to.');
-      if (result.status !== 'confirmed') lines.push('Reporting from the phone as well is the safer bet.');
+      lines.push(primary.blocked ? `${jidLabel(primary.jid)} is blocked on primary session.` : 'Not blocked on primary session.');
+
+      if (cascaded.length > 0) {
+        lines.push(`\nAuto-report triggered across ${cascaded.length} other paired session(s):`);
+        for (const c of cascaded) {
+          const iden = c.number ? `${c.label} (${c.number})` : c.label;
+          if (c.status === 'confirmed') {
+            lines.push(`• ${iden}: Confirmed (id ${c.reportId})`);
+          } else if (c.status === 'unconfirmed') {
+            lines.push(`• ${iden}: Answered without id`);
+          } else if (c.status === 'unanswered') {
+            lines.push(`• ${iden}: Unanswered`);
+          } else if (c.status === 'disconnected') {
+            lines.push(`• ${iden}: Skipped (disconnected)`);
+          } else {
+            lines.push(`• ${iden}: Failed (${c.error})`);
+          }
+        }
+        if (doBlock) lines.push('Block status applied across all available sessions.');
+      } else {
+        lines.push('No other paired sessions currently aboard to auto-report.');
+      }
+      if (primary.status !== 'confirmed') lines.push('Reporting from the phone as well is the safer bet.');
       return ctx.reply(lines.join('\n'));
     } catch (error) {
       log.warn('Report failed: %s', error.message);

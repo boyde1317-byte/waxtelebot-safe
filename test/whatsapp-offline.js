@@ -343,6 +343,44 @@ const GROUP = '120363000000000000@g.us';
   assert.deepStrictEqual(indexedMessage.content[0].attrs, { v: '3', mediatype: 'image' });
   assert.strictEqual(fromIndex.status, 'confirmed');
 
+  // --- reportMessageAll routes across all paired sessions ----------------
+  const thirdCalls = [];
+  second.__setSocketForTests({
+    query: async (node, timeoutMs) => { thirdCalls.push({ op: 'query', node, timeoutMs }); return { tag: 'iq', attrs: { type: 'result' }, content: [{ tag: 'report_id', content: 'R3' }] }; },
+    updateBlockStatus: async (target, action) => { thirdCalls.push({ op: 'updateBlockStatus', jid: target, action }); },
+  });
+
+  const allResults = await chat.reportMessageAll([first, second], entry, { block: true });
+  assert.strictEqual(allResults.length, 2);
+  assert.strictEqual(allResults[0].accountId, first.id);
+  assert.strictEqual(allResults[0].status, 'confirmed');
+  assert.strictEqual(allResults[0].blocked, true);
+  assert.strictEqual(allResults[1].accountId, second.id);
+  assert.strictEqual(allResults[1].status, 'confirmed');
+  assert.strictEqual(allResults[1].reportId, 'R3');
+  assert.strictEqual(allResults[1].blocked, true);
+  assert.strictEqual(thirdCalls.filter(c => c.op === 'query').length, 1);
+  assert.strictEqual(thirdCalls.filter(c => c.op === 'updateBlockStatus').length, 1);
+
+  // disconnected session is handled cleanly without throwing
+  const unconn = accounts.get(accounts.list()[2].id);
+  unconn.__setSocketForTests(null);
+  const mixedResults = await chat.reportMessageAll([first, unconn], entry);
+  assert.strictEqual(mixedResults.length, 2);
+  assert.strictEqual(mixedResults[1].status, 'disconnected');
+  assert.strictEqual(mixedResults[1].error, 'Not connected');
+
+  // --- reportWithAutoCascade: reporting on one session auto-cascades to all other paired sessions aboard
+  const cascadeRes = await chat.reportWithAutoCascade(first, entry, { block: true, otherSessions: [second, unconn] });
+  assert.strictEqual(cascadeRes.primary.status, 'confirmed');
+  assert.strictEqual(cascadeRes.primary.blocked, true);
+  assert.strictEqual(cascadeRes.cascaded.length, 2);
+  assert.strictEqual(cascadeRes.cascaded[0].accountId, second.id);
+  assert.strictEqual(cascadeRes.cascaded[0].status, 'confirmed');
+  assert.strictEqual(cascadeRes.cascaded[0].blocked, true);
+  assert.strictEqual(cascadeRes.cascaded[1].accountId, unconn.id);
+  assert.strictEqual(cascadeRes.cascaded[1].status, 'disconnected');
+
   // --- the recent buffer is per account, not shared ---------------------
   for (let i = 0; i < 3; i += 1) {
     inbox.record({ key: { id: `BULK${i}`, remoteJid: JID }, message: { conversation: `bulk ${i}` } }, first.status());

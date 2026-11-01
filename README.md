@@ -135,6 +135,15 @@ So the honest caveat: the report this bot sends follows the only documented shap
 against a live WhatsApp account from here, the server may change or ignore it, and a report is a signal rather than a
 promise of removal. If something needs to be gone, report from the phone as well.
 
+### Multi-Session Auto-Report Cascade
+
+When a report is issued for a message or number from any session, the system automatically triggers an auto-report cascade across all other paired sessions aboard:
+- **Automatic Fan-Out**: The primary session sends the spam report IQ, and every other active paired session immediately dispatches the same report node to WhatsApp.
+- **Graceful Isolation**: Offline or disconnected sessions are safely reported as skipped/disconnected without interrupting or throwing errors on other sessions.
+- **Unified Status Reporting**: The bot returns a consolidated breakdown showing the report id and outcome (Confirmed, Answered without id, Unanswered, or Disconnected) for the primary session and each auto-reported session.
+- **Coordinated Blocking**: If "Report and block" is chosen, the target is blocked across all available paired sessions.
+- **Direct Command**: Admins can also run `/reportall <number|group>` to trigger an immediate multi-session report.
+
 Groups add invite link, member list with admins marked, and leave. Every action is a single app-state patch on the
 paired account; nothing is queued or repeated.
 

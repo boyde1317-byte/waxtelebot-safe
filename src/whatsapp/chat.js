@@ -126,6 +126,116 @@ async function reportMessage(account, entry, { block = false, flow = null, subje
   return { jid: entry.jid, status, reportId, blocked, flow: node.content[0].attrs.spam_flow };
 }
 
+async function reportMessageAll(accountSessions, entry, { block = false, flow = null, subject = null } = {}) {
+  if (!Array.isArray(accountSessions) || !accountSessions.length) {
+    throw new Error('No paired sessions available to route report.');
+  }
+  const results = [];
+  for (const session of accountSessions) {
+    const label = session?.snapshot?.label || `Account ${session?.id}`;
+    const number = session?.snapshot?.number ? `+${session.snapshot.number}` : null;
+    try {
+      const isConnected = session.status ? session.status().connected : Boolean(session.socket);
+      if (!isConnected) {
+        results.push({
+          accountId: session.id,
+          label,
+          number,
+          status: 'disconnected',
+          reportId: null,
+          blocked: false,
+          error: 'Not connected',
+        });
+        continue;
+      }
+      const res = await reportMessage(session, entry, { block, flow, subject });
+      results.push({
+        accountId: session.id,
+        label,
+        number,
+        status: res.status,
+        reportId: res.reportId,
+        blocked: res.blocked,
+        error: null,
+      });
+    } catch (err) {
+      results.push({
+        accountId: session.id,
+        label,
+        number,
+        status: 'failed',
+        reportId: null,
+        blocked: false,
+        error: err.message,
+      });
+    }
+  }
+  return results;
+}
+
+// When any session reports a number/message, automatically cascade and trigger
+// a report through all other paired sessions aboard.
+async function reportWithAutoCascade(originSession, entry, { block = false, flow = null, subject = null, otherSessions = null } = {}) {
+  const primary = await reportMessage(originSession, entry, { block, flow, subject });
+
+  let others = otherSessions;
+  if (!others) {
+    try {
+      const accounts = require('./accounts');
+      const pairedRows = accounts.list().filter(a => a.id !== originSession.id && a.status.hasCreds);
+      others = pairedRows.map(r => accounts.get(r.id)).filter(Boolean);
+    } catch {
+      others = [];
+    }
+  }
+
+  const cascaded = [];
+  if (Array.isArray(others) && others.length > 0) {
+    for (const otherSession of others) {
+      if (otherSession.id === originSession.id) continue;
+      const label = otherSession?.snapshot?.label || `Account ${otherSession?.id}`;
+      const number = otherSession?.snapshot?.number ? `+${otherSession.snapshot.number}` : null;
+      try {
+        const isConnected = otherSession.status ? otherSession.status().connected : Boolean(otherSession.socket);
+        if (!isConnected) {
+          cascaded.push({
+            accountId: otherSession.id,
+            label,
+            number,
+            status: 'disconnected',
+            reportId: null,
+            blocked: false,
+            error: 'Not connected',
+          });
+          continue;
+        }
+        const res = await reportMessage(otherSession, entry, { block, flow, subject });
+        cascaded.push({
+          accountId: otherSession.id,
+          label,
+          number,
+          status: res.status,
+          reportId: res.reportId,
+          blocked: res.blocked,
+          error: null,
+        });
+      } catch (err) {
+        cascaded.push({
+          accountId: otherSession.id,
+          label,
+          number,
+          status: 'failed',
+          reportId: null,
+          blocked: false,
+          error: err.message,
+        });
+      }
+    }
+  }
+
+  return { primary, cascaded };
+}
+
 async function contactInfo(account, rawJid, defaultCountry) {
   const sock = account.requireSocket();
   const jid = target(rawJid, defaultCountry);
@@ -174,6 +284,6 @@ async function leaveGroup(account, rawJid, defaultCountry) {
 
 module.exports = {
   setMute, setPin, setArchive, markRead, clearChat, deleteChat, setBlocked,
-  reportMessage, buildSpamIq, reportIdFrom,
+  reportMessage, reportMessageAll, reportWithAutoCascade, buildSpamIq, reportIdFrom,
   contactInfo, groupInvite, groupMembers, leaveGroup, muteEnd,
 };
