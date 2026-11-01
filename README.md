@@ -22,7 +22,7 @@ Users: `/start`, `/feedback <message>`, `/feedback`, `/myfeedback`, `/cancel`, `
 Admins: `/inbox [page]`, `/reply <id> <message>`, `/resolve <id>`, `/adminstats`, `/adminhelp`
 
 WhatsApp (admins): `/wa` for the button menu, `/pair <number>`, `/send <number|group-id> <text>`,
-`/groups`, `/unpair`, `/cancelwa`
+`/chat <number|group>`, `/groups`, `/media`, `/unpair`, `/cancelwa`
 
 ## Behaviour
 
@@ -44,6 +44,22 @@ Pairing is by phone number, not QR:
 3. On the phone holding that account: Settings → Linked devices → Link a device → Link with phone number instead, then type the code.
 
 The session is saved to `WA_AUTH_DIR`, so the bot reconnects on its own after a restart. `/unpair` logs out and deletes it.
+
+### Chat actions
+
+`/chat <number|group>` opens the same set of actions the in-chat menu offers, one tap each: mute for 8 hours, a week
+or forever, unmute, pin, unpin, archive, unarchive, mark as read, clear messages, delete the chat, block, unblock, and
+contact info (on WhatsApp or not, about text, profile photo URL).
+
+Groups add invite link, member list with admins marked, and leave. Every action is a single app-state patch on the
+paired account; nothing is queued or repeated.
+
+### Saving media
+
+Received photos, videos, documents, voice notes and stickers are indexed in memory as they arrive (`WA_INBOX_LIMIT`,
+oldest dropped first). "Save media" lists the recent ones and tapping one downloads it and delivers the file to
+Telegram, wrapped view-once and disappearing media included. The index is memory only, so it empties on restart; the
+media itself still lives in your WhatsApp chat.
 
 Guards against a ban: one message per `WA_SEND_MIN_INTERVAL_MS`, at most `WA_SEND_HOURLY_CAP` per rolling hour, and no
 group broadcasting — the bot sends one message per command, to one destination. Every send is recorded in `wa_sends`

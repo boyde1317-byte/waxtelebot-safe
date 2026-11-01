@@ -47,4 +47,6 @@ module.exports = {
   waSendHourlyCap: parsePositiveInt(process.env.WA_SEND_HOURLY_CAP, 30),
   // Groups listed by /groups.
   waGroupListLimit: parsePositiveInt(process.env.WA_GROUP_LIST_LIMIT, 20),
+  // How many recent inbound media messages are kept for saving to Telegram.
+  waInboxLimit: parsePositiveInt(process.env.WA_INBOX_LIMIT, 40),
 };

@@ -25,6 +25,7 @@ let reconnectTimer = null;
 let attempts = 0;
 let stopping = false;
 let everConnected = false;
+let incomingHandler = null;
 
 const subscribers = new Set();
 function subscribe(fn) {
@@ -43,6 +44,13 @@ function broadcast(type, payload = {}) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Throws unless there is a live socket. Shared with the chat and media modules.
+function requireSocket() {
+  if (!config.waEnabled) throw new Error('WhatsApp is disabled by configuration.');
+  if (!sock || !snapshot.connected) throw new Error('WhatsApp is not connected. Pair it first with /pair.');
+  return sock;
 }
 
 function status() {
@@ -110,6 +118,16 @@ async function connect({ phone = null } = {}) {
 
   sock.ev.on('creds.update', saveCreds);
   sock.ev.on('connection.update', update => handleConnectionUpdate(b, update));
+  sock.ev.on('messages.upsert', event => {
+    if (!incomingHandler) return;
+    for (const message of event?.messages || []) {
+      try {
+        incomingHandler(message);
+      } catch (error) {
+        log.debug('Incoming message handler failed: %s', error.message);
+      }
+    }
+  });
 
   if (authState.creds.registered) return snapshot;
 
@@ -295,8 +313,22 @@ async function checkNumber(rawNumber) {
   return { digits, exists: Boolean(hit?.exists), jid: hit?.jid ? bareJid(hit.jid) : `${digits}@s.whatsapp.net` };
 }
 
+// Test-only: lets the offline suite assert the exact app-state patches without a live socket.
+function __setSocketForTests(fake) {
+  sock = fake || null;
+  snapshot.connected = Boolean(fake);
+}
+
+// Registered by the media inbox so the session stays free of those imports.
+function setIncomingHandler(fn) {
+  incomingHandler = fn;
+}
+
 module.exports = {
   subscribe,
+  requireSocket,
+  __setSocketForTests,
+  setIncomingHandler,
   status,
   restore,
   connect,

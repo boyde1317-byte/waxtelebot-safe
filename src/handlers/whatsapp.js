@@ -1,11 +1,22 @@
-// Telegram-side controls for the WhatsApp session: pairing, sending, groups.
+// Telegram-side controls for the WhatsApp session: pairing, sending, chat actions, media.
+const { Input } = require('telegraf');
 const config = require('../config');
 const db = require('../db');
 const log = require('../utils/logger');
 const wa = require('../whatsapp/session');
+const chat = require('../whatsapp/chat');
+const inbox = require('../whatsapp/inbox');
 const { toJid, jidLabel } = require('../whatsapp/jid');
 
 const pendingInput = new Map(); // adminId -> { step, jid }
+const activeChat = new Map(); // adminId -> jid the chat buttons act on
+
+const MUTE_OPTIONS = {
+  mute8: { label: 'Muted for 8 hours', ms: 8 * 60 * 60 * 1000 },
+  mute1w: { label: 'Muted for a week', ms: 7 * 24 * 60 * 60 * 1000 },
+  muteAlways: { label: 'Muted until you unmute it', ms: 100 * 365 * 24 * 60 * 60 * 1000 },
+  unmute: { label: 'Unmuted', ms: null },
+};
 
 function isAdmin(ctx) {
   return config.adminIds.includes(ctx.from?.id);
@@ -38,7 +49,11 @@ function menuKeyboard() {
         ],
         [
           { text: 'Send a message', callback_data: 'wa:send' },
-          { text: 'My groups', callback_data: 'wa:groups' },
+          { text: 'Save media', callback_data: 'wa:media' },
+        ],
+        [
+          { text: 'Chat actions', callback_data: 'wa:chat' },
+          { text: 'Groups', callback_data: 'wa:groups' },
         ],
         [
           { text: 'Check a number', callback_data: 'wa:check' },
@@ -54,9 +69,61 @@ function menuText() {
     'WhatsApp',
     statusLine(),
     '',
-    'Pick an action below, or use:',
-    '/pair <number> · /send <number|group> <text> · /groups · /unpair',
+    'Pick an action, or use a command:',
+    '/pair <number> · /send <number|group> <text> · /chat <number|group>',
+    '/groups · /media · /unpair · /cancelwa',
   ].join('\n');
+}
+
+function chatKeyboard(jid) {
+  const actions = [
+    [
+      { text: 'Mute 8h', callback_data: 'wac:mute8' },
+      { text: 'Mute 1w', callback_data: 'wac:mute1w' },
+      { text: 'Mute always', callback_data: 'wac:muteAlways' },
+    ],
+    [
+      { text: 'Unmute', callback_data: 'wac:unmute' },
+      { text: 'Pin', callback_data: 'wac:pin' },
+      { text: 'Unpin', callback_data: 'wac:unpin' },
+    ],
+    [
+      { text: 'Archive', callback_data: 'wac:archive' },
+      { text: 'Unarchive', callback_data: 'wac:unarchive' },
+      { text: 'Mark read', callback_data: 'wac:read' },
+    ],
+    [
+      { text: 'Clear messages', callback_data: 'wac:clear' },
+      { text: 'Delete chat', callback_data: 'wac:delete' },
+    ],
+    [
+      { text: 'Block', callback_data: 'wac:block' },
+      { text: 'Unblock', callback_data: 'wac:unblock' },
+      { text: 'Contact info', callback_data: 'wac:info' },
+    ],
+    [
+      { text: 'Send a message', callback_data: 'wac:send' },
+      { text: 'Media in this chat', callback_data: 'wac:media' },
+    ],
+  ];
+  return { text: `Chat: ${jidLabel(jid)}\nWhat should I do with it?`, reply_markup: { inline_keyboard: actions } };
+}
+
+function groupKeyboard(jid) {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: 'Send a message', callback_data: 'wag:send' },
+          { text: 'Invite link', callback_data: 'wag:link' },
+        ],
+        [
+          { text: 'Members', callback_data: 'wag:members' },
+          { text: 'Leave group', callback_data: 'wag:leave' },
+        ],
+      ],
+    },
+  };
 }
 
 function stage(adminId, step, extra = {}) {
@@ -113,6 +180,103 @@ async function replyGroups(ctx) {
   }
 }
 
+async function replyMedia(ctx, jid = null) {
+  const items = inbox.list({ jid, limit: 8 });
+  if (!items.length) {
+    return ctx.reply('Nothing recent. Media shows up here once it arrives while the bot is connected.');
+  }
+  const rows = items.map(item => [{
+    text: `${inbox.label(item)}`.slice(0, 60),
+    callback_data: `wa:m:${item.id}`,
+  }]);
+  return ctx.reply('Recent media. Tap one to bring it here.', { reply_markup: { inline_keyboard: rows } });
+}
+
+function fileNameFor(entry) {
+  const ext = (entry.mime || '').split('/')[1]?.split(';')[0] || 'bin';
+  return entry.fileName || `whatsapp-${entry.id.slice(-6)}.${ext}`;
+}
+
+async function sendMediaToTelegram(ctx, id) {
+  try {
+    const media = await inbox.download(id);
+    const caption = [`${jidLabel(media.jid)} · ${inbox.label(media)}`, media.caption].filter(Boolean).join('\n');
+    const input = Input.fromBuffer(media.buffer, fileNameFor(media));
+    if (media.mime.startsWith('image/')) return await ctx.replyWithPhoto(input, { caption });
+    if (media.mime.startsWith('video/')) return await ctx.replyWithVideo(input, { caption });
+    return await ctx.replyWithDocument(input, { caption });
+  } catch (error) {
+    log.warn('Media download failed: %s', error.message);
+    return ctx.reply(`Could not fetch that media: ${error.message}`);
+  }
+}
+
+// Runs one chat action and reports the outcome.
+async function runChatAction(ctx, jid, action) {
+  const country = config.waDefaultCountry;
+  const mute = MUTE_OPTIONS[action];
+
+  try {
+    if (mute) {
+      await chat.setMute(jid, mute.ms, country);
+      return ctx.reply(`${jidLabel(jid)}: ${mute.label}.`);
+    }
+    switch (action) {
+      case 'pin':
+        await chat.setPin(jid, true, country);
+        return ctx.reply(`${jidLabel(jid)} pinned.`);
+      case 'unpin':
+        await chat.setPin(jid, false, country);
+        return ctx.reply(`${jidLabel(jid)} unpinned.`);
+      case 'archive':
+        await chat.setArchive(jid, true, country);
+        return ctx.reply(`${jidLabel(jid)} archived.`);
+      case 'unarchive':
+        await chat.setArchive(jid, false, country);
+        return ctx.reply(`${jidLabel(jid)} unarchived.`);
+      case 'read':
+        await chat.markRead(jid, country);
+        return ctx.reply(`${jidLabel(jid)} marked as read.`);
+      case 'clear':
+        await chat.clearChat(jid, country);
+        return ctx.reply(`Messages cleared from ${jidLabel(jid)}.`);
+      case 'delete':
+        await chat.deleteChat(jid, country);
+        activeChat.delete(ctx.from.id);
+        return ctx.reply(`${jidLabel(jid)} deleted from the chat list.`);
+      case 'block':
+        await chat.setBlocked(jid, true, country);
+        return ctx.reply(`${jidLabel(jid)} blocked.`);
+      case 'unblock':
+        await chat.setBlocked(jid, false, country);
+        return ctx.reply(`${jidLabel(jid)} unblocked.`);
+      case 'info': {
+        const info = await chat.contactInfo(jid, country);
+        const lines = [
+          info.label,
+          info.exists === null ? null : info.exists ? 'on WhatsApp' : 'not on WhatsApp',
+          info.about ? `about: ${info.about}` : null,
+          info.picture ? `photo: ${info.picture}` : 'no profile photo visible',
+        ].filter(Boolean);
+        return ctx.reply(lines.join('\n'));
+      }
+      default:
+        return ctx.reply('I do not know that action.');
+    }
+  } catch (error) {
+    log.warn('Chat action %s failed: %s', action, error.message);
+    return ctx.reply(`Could not do that: ${error.message}`);
+  }
+}
+
+async function openChat(ctx, rawJid) {
+  const jid = toJid(rawJid, config.waDefaultCountry);
+  if (!jid) return ctx.reply('That is not a valid number or group id.');
+  activeChat.set(ctx.from.id, jid);
+  const { text, reply_markup } = chatKeyboard(jid);
+  return ctx.reply(text, { reply_markup });
+}
+
 function register(bot) {
   function notifyAdmins(text) {
     for (const adminId of config.adminIds) {
@@ -127,6 +291,7 @@ function register(bot) {
     if (type === 'reconnectFailed') notifyAdmins('WhatsApp could not reconnect. Use /wa to check and pair again.');
   });
 
+  // --- commands -----------------------------------------------------------
   bot.command('wa', async ctx => {
     if (!requireAdmin(ctx)) return;
     return ctx.reply(menuText(), menuKeyboard());
@@ -157,11 +322,34 @@ function register(bot) {
     return doSend(ctx, destination, text);
   });
 
+  bot.command('chat', async ctx => {
+    if (!requireAdmin(ctx)) return;
+    const target = ctx.message.text.replace(/^\/chat\s*/i, '').trim();
+    if (!target) {
+      stage(ctx.from.id, 'chat_target');
+      return ctx.reply('Which chat? Send a number with country code, or a group id ending in @g.us.');
+    }
+    return openChat(ctx, target);
+  });
+
   bot.command('groups', async ctx => {
     if (!requireAdmin(ctx)) return;
     return replyGroups(ctx);
   });
 
+  bot.command('media', async ctx => {
+    if (!requireAdmin(ctx)) return;
+    return replyMedia(ctx);
+  });
+
+  bot.command('cancelwa', ctx => {
+    if (!requireAdmin(ctx)) return;
+    clearStage(ctx.from.id);
+    activeChat.delete(ctx.from.id);
+    return ctx.reply('Cancelled.');
+  });
+
+  // --- menu buttons -------------------------------------------------------
   bot.action('wa:menu', async ctx => {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
     await ctx.editMessageText(menuText(), menuKeyboard()).catch(() => ctx.reply(menuText(), menuKeyboard()));
@@ -211,22 +399,97 @@ function register(bot) {
     return ctx.reply(lines.join('\n'));
   });
 
+  bot.action('wa:chat', async ctx => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
+    await ctx.answerCbQuery();
+    stage(ctx.from.id, 'chat_target');
+    return ctx.reply('Which chat? Send a number with country code, or a group id ending in @g.us.');
+  });
+
   bot.action('wa:groups', async ctx => {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
     await ctx.answerCbQuery();
     return replyGroups(ctx);
   });
 
-  // Group picked from the /groups buttons
+  bot.action('wa:media', async ctx => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
+    await ctx.answerCbQuery();
+    return replyMedia(ctx);
+  });
+
+  // --- media download -----------------------------------------------------
+  bot.action(/^wa:m:(.+)$/, async ctx => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
+    await ctx.answerCbQuery('Fetching…');
+    return sendMediaToTelegram(ctx, ctx.match[1]);
+  });
+
+  // --- chat actions -------------------------------------------------------
+  bot.action(/^wac:(.+)$/, async ctx => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
+    const action = ctx.match[1];
+    const jid = activeChat.get(ctx.from.id);
+    if (!jid) {
+      await ctx.answerCbQuery();
+      return ctx.reply('Pick a chat first with /chat <number or group>.');
+    }
+    await ctx.answerCbQuery();
+
+    if (action === 'send') {
+      stage(ctx.from.id, 'send_text', { jid });
+      return ctx.reply(`Message for ${jidLabel(jid)}? Send the text now.`);
+    }
+    if (action === 'media') return replyMedia(ctx, jid);
+    return runChatAction(ctx, jid, action);
+  });
+
+  // --- group picked from the list -----------------------------------------
   bot.action(/^wa:g:(.+)$/, async ctx => {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
     const jid = ctx.match[1];
     await ctx.answerCbQuery();
-    stage(ctx.from.id, 'send_text', { jid });
-    return ctx.reply(`Message for ${jidLabel(jid)}? Send the text now.`);
+    activeChat.set(ctx.from.id, jid);
+    return ctx.reply(`Group: ${jidLabel(jid)}`, groupKeyboard(jid));
   });
 
-  // Staged text input: runs before the feedback prompt handler.
+  bot.action(/^wag:(.+)$/, async ctx => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
+    const action = ctx.match[1];
+    const jid = activeChat.get(ctx.from.id);
+    if (!jid) {
+      await ctx.answerCbQuery();
+      return ctx.reply('Pick a group from /groups first.');
+    }
+    await ctx.answerCbQuery();
+
+    if (action === 'send') {
+      stage(ctx.from.id, 'send_text', { jid });
+      return ctx.reply(`Message for ${jidLabel(jid)}? Send the text now.`);
+    }
+    try {
+      if (action === 'link') {
+        const { link } = await chat.groupInvite(jid, config.waDefaultCountry);
+        return ctx.reply(`Invite link for ${jidLabel(jid)}:\n${link}`);
+      }
+      if (action === 'members') {
+        const info = await chat.groupMembers(jid, 30, config.waDefaultCountry);
+        const lines = info.members.map(m => `${m.admin ? '*' : '-'} ${m.jid}`);
+        return ctx.reply(`${info.subject} · ${info.total} members\n${lines.join('\n')}`);
+      }
+      if (action === 'leave') {
+        await chat.leaveGroup(jid, config.waDefaultCountry);
+        activeChat.delete(ctx.from.id);
+        return ctx.reply(`Left ${jidLabel(jid)}.`);
+      }
+      return ctx.reply('I do not know that action.');
+    } catch (error) {
+      log.warn('Group action %s failed: %s', action, error.message);
+      return ctx.reply(`Could not do that: ${error.message}`);
+    }
+  });
+
+  // --- staged text input --------------------------------------------------
   bot.on('text', async (ctx, next) => {
     const step = pendingInput.get(ctx.from.id);
     if (!step || ctx.message.text.startsWith('/')) return next();
@@ -237,12 +500,14 @@ function register(bot) {
       return beginPairing(ctx, text);
     }
 
-    if (step.step === 'send_to') {
+    if (step.step === 'send_to' || step.step === 'chat_target') {
       const jid = toJid(text, config.waDefaultCountry);
       if (!jid) {
-        await ctx.reply('That is not a valid number or group id. Try again, or /cancel.');
+        await ctx.reply('That is not a valid number or group id. Try again, or /cancelwa.');
         return true;
       }
+      clearStage(ctx.from.id);
+      if (step.step === 'chat_target') return openChat(ctx, jid);
       stage(ctx.from.id, 'send_text', { jid });
       await ctx.reply(`Message for ${jidLabel(jid)}? Send the text now.`);
       return true;
@@ -268,12 +533,9 @@ function register(bot) {
 
     return next();
   });
-
-  bot.command('cancelwa', ctx => {
-    if (!requireAdmin(ctx)) return;
-    clearStage(ctx.from.id);
-    return ctx.reply('Cancelled.');
-  });
 }
 
-module.exports = { register, statusLine, menuText, menuKeyboard };
+module.exports = {
+  register, statusLine, menuText, menuKeyboard, chatKeyboard, groupKeyboard,
+  MUTE_OPTIONS,
+};

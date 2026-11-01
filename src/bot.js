@@ -6,6 +6,7 @@ const whatsappHandler = require('./handlers/whatsapp');
 const startHandler = require('./handlers/start');
 const adminHandler = require('./handlers/admin');
 const wa = require('./whatsapp/session');
+const waInbox = require('./whatsapp/inbox');
 
 if (!config.botToken) throw new Error('Missing BOT_TOKEN. Copy .env.example to .env and set BOT_TOKEN.');
 
@@ -30,6 +31,7 @@ async function main() {
   await bot.launch({ dropPendingUpdates: false });
   log.info('Bot is live.');
   if (config.waEnabled) {
+    waInbox.attach();
     wa.restore().then(status => log.info('WhatsApp: %s', status.connected ? `connected as +${status.number}` : status.state));
   }
 }
