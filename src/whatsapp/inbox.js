@@ -85,6 +85,10 @@ function lastText(jid) {
   return entry ? { text: entry.text, sender: entry.sender, at: entry.at } : null;
 }
 
+function get(id) {
+  return entries.get(id) || null;
+}
+
 function label(entry) {
   const kind = entry.kind === 'text'
     ? 'text'
@@ -111,4 +115,4 @@ function attach() {
   session.setIncomingHandler(record);
 }
 
-module.exports = { attach, record, list, download, label, lastText, clear: () => { entries.clear(); order.length = 0; } };
+module.exports = { attach, record, list, get, download, label, lastText, clear: () => { entries.clear(); order.length = 0; } };

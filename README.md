@@ -54,10 +54,44 @@ report, copy the last message, and contact info (on WhatsApp or not, about text,
 **Copy** returns the newest message text received in that chat, so you can select it in Telegram. Only messages seen
 while the bot is connected are held.
 
-**Report** asks for confirmation first, because it is not reversible: "Report" or "Report and block", and WhatsApp gets
-the same spam signal the web client sends. There is no public API for it and WhatsApp never confirms receipt, so treat
-a report as a signal rather than a guaranteed removal. Report and block a number from here when the phone's own menu
-will not cooperate.
+**Report** sends a spam report for the newest message received in that chat, after asking for confirmation
+("Report" or "Report and block"). With nothing received since startup there is nothing to report, and the bot says so
+instead of pretending.
+
+## Report: what is actually known
+
+This is the least certain thing in the project, so here is the evidence rather than a claim.
+
+- **Baileys has no report API.** Nothing in the library builds a spam request. Upstream's own answer to
+  [issue #2018, "How to report messages to WhatsApp using baileys"](https://github.com/WhiskeySockets/Baileys/issues/2018)
+  is a flat "Not supported".
+- **The only detailed wire format is in whatsapp-rust**, the Rust core this Baileys 7 install bridges into
+  (`whatsapp-rust-bridge`). Its `SpamReportSpec` documents the request and the reply:
+
+  ```xml
+  <iq xmlns="spam" type="set" to="s.whatsapp.net" id="...">
+    <spam_list spam_flow="MessageMenu">
+      <message id="MSG_ID" t="1234567890" from="1234567890@s.whatsapp.net">
+        <raw v="3" mediatype="image">…protobuf bytes…</raw>
+      </message>
+    </spam_list>
+  </iq>
+  <iq type="result" id="..."><report_id>REPORT_123</report_id></iq>
+  ```
+
+  Its `spam_flow` values are `MessageMenu`, `ContactInfo`, `GroupInfoReport`, `GroupSpamBannerReport` and
+  `StatusReport`. A report is always **about a message**: id, timestamp, sender, and the message bytes.
+- **A popular Baileys fork does it differently**, with no message node at all:
+  `<spam_list jid="…" spam_flow="account_info_block"/>`. That is a second, incompatible shape in the wild, which is the
+  clearest sign that none of this is contractual.
+- **`query()` does not raise on silence.** In Baileys 7 `waitForMessage` catches the timeout and resolves `undefined`
+  (60 seconds by default). A naive `await sock.query(node)` therefore reports success with zero evidence. Here the
+  timeout is `WA_QUERY_TIMEOUT_MS` (15s) and only a `<report_id>` counts as confirmed.
+
+So the honest caveat: the report this bot sends follows the only documented shape available, and it distinguishes
+"accepted (report id)", "answered without an id" and "no answer" in what it tells you. It has not been confirmed
+against a live WhatsApp account from here, the server may change or ignore it, and a report is a signal rather than a
+promise of removal. If something needs to be gone, report from the phone as well.
 
 Groups add invite link, member list with admins marked, and leave. Every action is a single app-state patch on the
 paired account; nothing is queued or repeated.

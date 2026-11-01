@@ -1,4 +1,5 @@
 // Chat-level actions: the things WhatsApp's in-chat menu does, driven from Telegram.
+const config = require('../config');
 const session = require('./session');
 const { toJid, jidLabel } = require('./jid');
 
@@ -57,22 +58,73 @@ async function setBlocked(rawJid, blocked, defaultCountry) {
   return jid;
 }
 
-// WhatsApp has no public endpoint for this; it is the same spam IQ the web client sends.
-async function report(rawJid, { block = false } = {}, defaultCountry) {
-  const sock = session.requireSocket();
-  const jid = target(rawJid, defaultCountry);
-  const node = {
+// Reporting is undocumented. The only detailed wire format available comes from
+// whatsapp-rust (the core Baileys 7 embeds through whatsapp-rust-bridge): the IQ
+// reports a *message*, carries spam_flow on <spam_list>, and answers with report_id.
+// Baileys itself exposes nothing for this and upstream calls it unsupported.
+
+function reportIdFrom(result) {
+  const children = Array.isArray(result?.content) ? result.content : [];
+  for (const node of children) {
+    if (node?.tag !== 'report_id') continue;
+    if (Buffer.isBuffer(node.content)) return node.content.toString('utf8');
+    if (typeof node.content === 'string') return node.content;
+    const first = Array.isArray(node.content) ? node.content[0]?.content : null;
+    return first ? String(first) : null;
+  }
+  return null;
+}
+
+// Builds the spam IQ for one indexed message. Exported so the shape can be tested.
+function buildSpamIq(entry, { flow, subject = null } = {}) {
+  const { proto } = require('baileys');
+  const spamFlow = flow || (entry.isGroup ? 'GroupInfoReport' : 'MessageMenu');
+  const listAttrs = { spam_flow: spamFlow };
+  if (entry.isGroup) {
+    listAttrs.jid = entry.jid;
+    if (subject) listAttrs.subject = subject;
+  }
+
+  const messageAttrs = { id: entry.id, t: String(Math.floor(entry.at / 1000)) };
+  if (entry.fromJid) messageAttrs.from = entry.fromJid;
+  if (entry.isGroup && entry.participant) messageAttrs.participant = entry.participant;
+
+  const messageChildren = [];
+  if (entry.inner) {
+    const rawAttrs = { v: '3' };
+    if (entry.mediaType) rawAttrs.mediatype = entry.mediaType;
+    const bytes = proto.Message.encode(proto.Message.fromObject(entry.inner)).finish();
+    messageChildren.push({ tag: 'raw', attrs: rawAttrs, content: Buffer.from(bytes) });
+  }
+
+  return {
     tag: 'iq',
     attrs: { to: 's.whatsapp.net', type: 'set', xmlns: 'spam' },
     content: [{
       tag: 'spam_list',
-      attrs: {},
-      content: [{ tag: 'item', attrs: { jid, spam_flow: 'unsolicited' } }],
+      attrs: listAttrs,
+      content: [{ tag: 'message', attrs: messageAttrs, content: messageChildren }],
     }],
   };
-  await sock.query(node);
-  if (block) await sock.updateBlockStatus(jid, 'block');
-  return { jid, blocked: Boolean(block) };
+}
+
+async function reportMessage(entry, { block = false, flow = null, subject = null } = {}) {
+  const sock = session.requireSocket();
+  if (!entry?.id) throw new Error('There is no message to report.');
+
+  const node = buildSpamIq(entry, { flow, subject });
+  // query() resolves to undefined when the server never answers, so the return
+  // value is the only evidence we have.
+  const result = await sock.query(node, config.waQueryTimeoutMs);
+  const reportId = reportIdFrom(result);
+  const status = result === undefined ? 'unanswered' : reportId ? 'confirmed' : 'unconfirmed';
+
+  let blocked = false;
+  if (block) {
+    await sock.updateBlockStatus(entry.jid, 'block');
+    blocked = true;
+  }
+  return { jid: entry.jid, status, reportId, blocked, flow: node.content[0].attrs.spam_flow };
 }
 
 async function contactInfo(rawJid, defaultCountry) {
@@ -122,6 +174,7 @@ async function leaveGroup(rawJid, defaultCountry) {
 }
 
 module.exports = {
-  setMute, setPin, setArchive, markRead, clearChat, deleteChat, setBlocked, report,
+  setMute, setPin, setArchive, markRead, clearChat, deleteChat, setBlocked,
+  reportMessage, buildSpamIq, reportIdFrom,
   contactInfo, groupInvite, groupMembers, leaveGroup, muteEnd,
 };

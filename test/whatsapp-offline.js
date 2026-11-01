@@ -8,6 +8,7 @@ const assert = require('assert');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const jid = require('../src/whatsapp/jid');
+const { proto } = require('baileys');
 
 // --- phone and JID handling ----------------------------------------------
 assert.strictEqual(jid.toPhoneDigits('+233 24 123 4567'), '233241234567');
@@ -68,11 +69,12 @@ assert.strictEqual(wa.hasCreds(), false);
   const session = require('../src/whatsapp/session');
   const chat = require('../src/whatsapp/chat');
   const calls = [];
-  session.__setSocketForTests({
+  const fakeSocket = {
     chatModify: async (mod, jid) => { calls.push({ op: 'chatModify', mod, jid }); },
     updateBlockStatus: async (jid, action) => { calls.push({ op: 'updateBlockStatus', jid, action }); },
     groupLeave: async jid => { calls.push({ op: 'groupLeave', jid }); },
-    query: async node => { calls.push({ op: 'query', node }); return { tag: 'iq', attrs: { type: 'result' } }; },
+    query: async (node, timeoutMs) => { calls.push({ op: 'query', node, timeoutMs }); return fakeSocket.queryResult; },
+    queryResult: undefined,
     groupInviteCode: async () => 'INVITECODE123',
     groupMetadata: async () => ({
       subject: 'Squad',
@@ -84,7 +86,8 @@ assert.strictEqual(wa.hasCreds(), false);
     fetchStatus: async () => [{ status: { text: 'busy' } }],
     onWhatsApp: async () => [{ exists: true, jid: '233241234567@s.whatsapp.net' }],
     profilePictureUrl: async () => 'https://example.invalid/pic.jpg',
-  });
+  };
+  session.__setSocketForTests(fakeSocket);
 
   const JID = '233241234567@s.whatsapp.net';
 
@@ -133,23 +136,69 @@ assert.strictEqual(wa.hasCreds(), false);
   await chat.leaveGroup('120363000000000000@g.us');
   assert.strictEqual(calls.pop().op, 'groupLeave');
 
-  await chat.report('+233241234567');
+  // --- report: exact spam IQ from the whatsapp-rust wire format ----------
+  const entry = {
+    id: 'MSG1',
+    jid: JID,
+    at: 1793000000000,
+    fromJid: JID,
+    isGroup: false,
+    mediaType: null,
+    inner: { conversation: 'pay me 200 cedis' },
+  };
+
+  fakeSocket.queryResult = { tag: 'iq', attrs: { type: 'result' }, content: [{ tag: 'report_id', content: 'REPORT_9' }] };
+  const reported = await chat.reportMessage(entry);
   const reportCall = calls.pop();
   assert.strictEqual(reportCall.op, 'query');
-  assert.strictEqual(reportCall.node.tag, 'iq');
+  assert.strictEqual(reportCall.timeoutMs, 15000, 'a report never waits the 60s default');
   assert.deepStrictEqual(reportCall.node.attrs, { to: 's.whatsapp.net', type: 'set', xmlns: 'spam' });
-  assert.strictEqual(reportCall.node.content[0].tag, 'spam_list');
-  assert.deepStrictEqual(reportCall.node.content[0].content[0].attrs, { jid: JID, spam_flow: 'unsolicited' });
+  const spamList = reportCall.node.content[0];
+  assert.strictEqual(spamList.tag, 'spam_list');
+  assert.deepStrictEqual(spamList.attrs, { spam_flow: 'MessageMenu' }, 'spam_flow lives on spam_list');
+  const messageNode = spamList.content[0];
+  assert.strictEqual(messageNode.tag, 'message');
+  assert.deepStrictEqual(messageNode.attrs, { id: 'MSG1', t: '1793000000', from: JID });
+  const rawNode = messageNode.content[0];
+  assert.strictEqual(rawNode.tag, 'raw');
+  assert.deepStrictEqual(rawNode.attrs, { v: '3' });
+  assert.ok(Buffer.isBuffer(rawNode.content) && rawNode.content.length > 0, 'the message bytes are attached');
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(proto.Message.decode(rawNode.content))), { conversation: 'pay me 200 cedis' });
+  assert.strictEqual(reported.status, 'confirmed');
+  assert.strictEqual(reported.reportId, 'REPORT_9');
+  assert.strictEqual(reported.blocked, false);
 
-  const reportAndBlock = await chat.report('+233241234567', { block: true });
-  assert.deepStrictEqual(calls.pop(), { op: 'updateBlockStatus', jid: JID, action: 'block' });
-  assert.deepStrictEqual(reportAndBlock, { jid: JID, blocked: true });
-  assert.strictEqual(calls.pop().op, 'query', 'report is sent before the block');
+  // group report carries the group and the sender
+  const groupEntry = {
+    id: 'G1', jid: '120363000000000000@g.us', at: 1793000500000, isGroup: true,
+    fromJid: '233249999999@s.whatsapp.net', participant: '233249999999@s.whatsapp.net',
+    mediaType: 'image', inner: { imageMessage: { mimetype: 'image/jpeg' } },
+  };
+  await chat.reportMessage(groupEntry, { subject: 'Squad', block: true });
+  const blockCall = calls.pop();
+  assert.deepStrictEqual(blockCall, { op: 'updateBlockStatus', jid: '120363000000000000@g.us', action: 'block' });
+  const groupCall = calls.pop();
+  assert.deepStrictEqual(groupCall.node.content[0].attrs, { spam_flow: 'GroupInfoReport', jid: '120363000000000000@g.us', subject: 'Squad' });
+  assert.deepStrictEqual(groupCall.node.content[0].content[0].attrs, {
+    id: 'G1', t: '1793000500', from: '233249999999@s.whatsapp.net', participant: '233249999999@s.whatsapp.net',
+  });
+  assert.deepStrictEqual(groupCall.node.content[0].content[0].content[0].attrs, { v: '3', mediatype: 'image' });
 
-  await chat.report('+233241234567').then(
-    () => { throw new Error('report without a socket should be rejected'); },
-    () => {}
-  ).catch(() => {});
+  // unanswered: query() resolves undefined on timeout, which must not read as success
+  fakeSocket.queryResult = undefined;
+  const unanswered = await chat.reportMessage(entry);
+  assert.strictEqual(unanswered.status, 'unanswered');
+  assert.strictEqual(unanswered.reportId, null);
+
+  // answered but with no report id
+  fakeSocket.queryResult = { tag: 'iq', attrs: { type: 'result' }, content: [] };
+  const unconfirmed = await chat.reportMessage(entry);
+  assert.strictEqual(unconfirmed.status, 'unconfirmed');
+
+  await chat.reportMessage(null).then(
+    () => { throw new Error('reporting nothing should be rejected'); },
+    error => assert.match(error.message, /no message to report/i)
+  );
 
   await chat.setPin('not a number', true).then(
     () => { throw new Error('a bad target should be rejected'); },

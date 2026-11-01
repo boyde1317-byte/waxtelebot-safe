@@ -9,6 +9,7 @@ const inbox = require('../whatsapp/inbox');
 const { toJid, jidLabel } = require('../whatsapp/jid');
 
 const pendingInput = new Map(); // adminId -> { step, jid }
+const reportTarget = new Map(); // adminId -> message id awaiting a report decision
 const activeChat = new Map(); // adminId -> jid the chat buttons act on
 
 const MUTE_OPTIONS = {
@@ -251,9 +252,23 @@ async function runChatAction(ctx, jid, action) {
       case 'block':
         await chat.setBlocked(jid, true, country);
         return ctx.reply(`${jidLabel(jid)} blocked.`);
-      case 'report':
+      case 'report': {
+        const [entry] = inbox.list({ jid, limit: 1 });
+        if (!entry) {
+          return ctx.reply(
+            `Nothing from ${jidLabel(jid)} to report.\n\nWhatsApp takes reports against a specific message, and I only hold messages that arrive while the bot is connected. Wait for one to come in, then try again.`
+          );
+        }
+        reportTarget.set(ctx.from.id, entry.id);
+        const preview = (entry.text || '(media without a caption)').slice(0, 160);
         return ctx.reply(
-          `Report ${jidLabel(jid)} to WhatsApp?\n\nThis sends a spam report from your account and cannot be undone. WhatsApp does not tell us whether it was received.`,
+          [
+            `Report this message from ${jidLabel(jid)} to WhatsApp?`,
+            '',
+            `"${preview}"`,
+            '',
+            'This is undocumented and cannot be undone. WhatsApp may answer with a report id, or not at all.',
+          ].join('\n'),
           {
             reply_markup: {
               inline_keyboard: [[
@@ -265,6 +280,7 @@ async function runChatAction(ctx, jid, action) {
             },
           }
         );
+      }
       case 'copy': {
         const last = inbox.lastText(jid);
         if (!last) {
@@ -473,21 +489,37 @@ function register(bot) {
   bot.action(/^wacr:(.+)$/, async ctx => {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
     const choice = ctx.match[1];
-    const jid = activeChat.get(ctx.from.id);
-    if (!jid) {
-      await ctx.answerCbQuery();
-      return ctx.reply('Pick a chat first with /chat <number or group>.');
-    }
+    const entryId = reportTarget.get(ctx.from.id);
     if (choice === 'cancel') {
+      reportTarget.delete(ctx.from.id);
       await ctx.answerCbQuery();
       return ctx.reply('Report cancelled.');
     }
+    const entry = entryId ? inbox.get(entryId) : null;
+    if (!entry) {
+      await ctx.answerCbQuery();
+      return ctx.reply('That message is no longer in the recent list, so there is nothing to report.');
+    }
     await ctx.answerCbQuery('Reporting…');
     try {
-      const result = await chat.report(jid, { block: choice === 'block' }, config.waDefaultCountry);
-      return ctx.reply(
-        `Report sent for ${jidLabel(result.jid)}${result.blocked ? ', and blocked' : ''}.\nIf nothing changes on the phone, report from there as well: WhatsApp treats this as a signal, not a guaranteed removal.`
-      );
+      let subject = null;
+      if (entry.isGroup) {
+        subject = await chat.groupMembers(entry.jid, 1, config.waDefaultCountry)
+          .then(info => info.subject).catch(() => null);
+      }
+      const result = await chat.reportMessage(entry, { block: choice === 'block', subject });
+      reportTarget.delete(ctx.from.id);
+      const lines = [];
+      if (result.status === 'confirmed') {
+        lines.push(`WhatsApp accepted the report (id ${result.reportId}). That is the server acknowledging it, not a promise of removal.`);
+      } else if (result.status === 'unconfirmed') {
+        lines.push('WhatsApp answered without a report id. Treat the report as unconfirmed.');
+      } else {
+        lines.push(`WhatsApp never answered within ${Math.round(config.waQueryTimeoutMs / 1000)}s. The report may not have been accepted.`);
+      }
+      lines.push(result.blocked ? `${jidLabel(result.jid)} is blocked.` : `Not blocked; block with the Block button if you want to.`);
+      if (result.status !== 'confirmed') lines.push('Reporting from the phone as well is the safer bet.');
+      return ctx.reply(lines.join('\n'));
     } catch (error) {
       log.warn('Report failed: %s', error.message);
       return ctx.reply(`Could not report: ${error.message}`);

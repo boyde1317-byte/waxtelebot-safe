@@ -49,4 +49,6 @@ module.exports = {
   waGroupListLimit: parsePositiveInt(process.env.WA_GROUP_LIST_LIMIT, 20),
   // How many recent inbound media messages are kept for saving to Telegram.
   waInboxLimit: parsePositiveInt(process.env.WA_INBOX_LIMIT, 40),
+  // How long to wait for an IQ result before treating it as unanswered.
+  waQueryTimeoutMs: parsePositiveInt(process.env.WA_QUERY_TIMEOUT_MS, 15000),
 };
