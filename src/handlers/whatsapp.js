@@ -99,7 +99,11 @@ function chatKeyboard(jid) {
     [
       { text: 'Block', callback_data: 'wac:block' },
       { text: 'Unblock', callback_data: 'wac:unblock' },
+      { text: 'Report', callback_data: 'wac:report' },
+    ],
+    [
       { text: 'Contact info', callback_data: 'wac:info' },
+      { text: 'Copy last message', callback_data: 'wac:copy' },
     ],
     [
       { text: 'Send a message', callback_data: 'wac:send' },
@@ -181,7 +185,7 @@ async function replyGroups(ctx) {
 }
 
 async function replyMedia(ctx, jid = null) {
-  const items = inbox.list({ jid, limit: 8 });
+  const items = inbox.list({ jid, kind: 'media', limit: 8 });
   if (!items.length) {
     return ctx.reply('Nothing recent. Media shows up here once it arrives while the bot is connected.');
   }
@@ -247,6 +251,27 @@ async function runChatAction(ctx, jid, action) {
       case 'block':
         await chat.setBlocked(jid, true, country);
         return ctx.reply(`${jidLabel(jid)} blocked.`);
+      case 'report':
+        return ctx.reply(
+          `Report ${jidLabel(jid)} to WhatsApp?\n\nThis sends a spam report from your account and cannot be undone. WhatsApp does not tell us whether it was received.`,
+          {
+            reply_markup: {
+              inline_keyboard: [[
+                { text: 'Report', callback_data: 'wacr:solo' },
+                { text: 'Report and block', callback_data: 'wacr:block' },
+              ], [
+                { text: 'Cancel', callback_data: 'wacr:cancel' },
+              ]],
+            },
+          }
+        );
+      case 'copy': {
+        const last = inbox.lastText(jid);
+        if (!last) {
+          return ctx.reply(`Nothing to copy from ${jidLabel(jid)} yet. I only keep messages that arrive while the bot is connected.`);
+        }
+        return ctx.reply(`Last message from ${jidLabel(jid)}:\n\n${last.text}`);
+      }
       case 'unblock':
         await chat.setBlocked(jid, false, country);
         return ctx.reply(`${jidLabel(jid)} unblocked.`);
@@ -442,6 +467,31 @@ function register(bot) {
     }
     if (action === 'media') return replyMedia(ctx, jid);
     return runChatAction(ctx, jid, action);
+  });
+
+  // --- report confirmation -------------------------------------------------
+  bot.action(/^wacr:(.+)$/, async ctx => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
+    const choice = ctx.match[1];
+    const jid = activeChat.get(ctx.from.id);
+    if (!jid) {
+      await ctx.answerCbQuery();
+      return ctx.reply('Pick a chat first with /chat <number or group>.');
+    }
+    if (choice === 'cancel') {
+      await ctx.answerCbQuery();
+      return ctx.reply('Report cancelled.');
+    }
+    await ctx.answerCbQuery('Reporting…');
+    try {
+      const result = await chat.report(jid, { block: choice === 'block' }, config.waDefaultCountry);
+      return ctx.reply(
+        `Report sent for ${jidLabel(result.jid)}${result.blocked ? ', and blocked' : ''}.\nIf nothing changes on the phone, report from there as well: WhatsApp treats this as a signal, not a guaranteed removal.`
+      );
+    } catch (error) {
+      log.warn('Report failed: %s', error.message);
+      return ctx.reply(`Could not report: ${error.message}`);
+    }
   });
 
   // --- group picked from the list -----------------------------------------

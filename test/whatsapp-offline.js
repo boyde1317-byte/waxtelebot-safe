@@ -72,6 +72,7 @@ assert.strictEqual(wa.hasCreds(), false);
     chatModify: async (mod, jid) => { calls.push({ op: 'chatModify', mod, jid }); },
     updateBlockStatus: async (jid, action) => { calls.push({ op: 'updateBlockStatus', jid, action }); },
     groupLeave: async jid => { calls.push({ op: 'groupLeave', jid }); },
+    query: async node => { calls.push({ op: 'query', node }); return { tag: 'iq', attrs: { type: 'result' } }; },
     groupInviteCode: async () => 'INVITECODE123',
     groupMetadata: async () => ({
       subject: 'Squad',
@@ -132,6 +133,24 @@ assert.strictEqual(wa.hasCreds(), false);
   await chat.leaveGroup('120363000000000000@g.us');
   assert.strictEqual(calls.pop().op, 'groupLeave');
 
+  await chat.report('+233241234567');
+  const reportCall = calls.pop();
+  assert.strictEqual(reportCall.op, 'query');
+  assert.strictEqual(reportCall.node.tag, 'iq');
+  assert.deepStrictEqual(reportCall.node.attrs, { to: 's.whatsapp.net', type: 'set', xmlns: 'spam' });
+  assert.strictEqual(reportCall.node.content[0].tag, 'spam_list');
+  assert.deepStrictEqual(reportCall.node.content[0].content[0].attrs, { jid: JID, spam_flow: 'unsolicited' });
+
+  const reportAndBlock = await chat.report('+233241234567', { block: true });
+  assert.deepStrictEqual(calls.pop(), { op: 'updateBlockStatus', jid: JID, action: 'block' });
+  assert.deepStrictEqual(reportAndBlock, { jid: JID, blocked: true });
+  assert.strictEqual(calls.pop().op, 'query', 'report is sent before the block');
+
+  await chat.report('+233241234567').then(
+    () => { throw new Error('report without a socket should be rejected'); },
+    () => {}
+  ).catch(() => {});
+
   await chat.setPin('not a number', true).then(
     () => { throw new Error('a bad target should be rejected'); },
     error => assert.match(error.message, /valid number or group/i)
@@ -151,13 +170,22 @@ assert.strictEqual(wa.hasCreds(), false);
   inbox.record({ key: { id: 'EPH1', remoteJid: JID }, messageTimestamp: 1793000100, message: { ephemeralMessage: { message: { imageMessage: { mimetype: 'image/png' } } } } });
 
   const listed = inbox.list({ limit: 5 });
-  assert.strictEqual(listed.length, 2, 'text messages are not indexed');
+  assert.strictEqual(listed.length, 3, 'text is indexed alongside media');
+  assert.strictEqual(listed.filter(e => e.kind === 'media').length, 2);
+  assert.strictEqual(listed.filter(e => e.kind === 'text').length, 1);
   assert.strictEqual(listed[0].id, 'EPH1', 'newest first, and wrapped media is unwrapped');
   assert.strictEqual(listed[0].mime, 'image/png');
-  assert.strictEqual(listed[1].caption, 'look at this');
-  assert.match(inbox.label(listed[1]), /image · Ama/);
+  const imageEntry = listed.find(e => e.id === 'MSG1');
+  assert.strictEqual(imageEntry.caption, 'look at this');
+  assert.match(inbox.label(imageEntry), /image · Ama/);
+  assert.strictEqual(listed[1].id, 'TXT1');
+  assert.match(inbox.label(listed[1]), /text · /);
+  const lastText = inbox.lastText(JID);
+  assert.strictEqual(lastText.text, 'hello');
+  assert.strictEqual(inbox.lastText('120363000000000000@g.us'), null);
+  assert.strictEqual(inbox.list({ jid: JID, kind: 'media' }).length, 2, 'media filter excludes text');
   assert.strictEqual(inbox.list({ jid: '120363000000000000@g.us' }).length, 0);
-  assert.strictEqual(inbox.list({ jid: JID }).length, 2);
+  assert.strictEqual(inbox.list({ jid: JID }).length, 3);
   await assert.rejects(() => inbox.download('MSG1'), /not connected/i, 'downloading needs a live socket');
 
   // --- expanded menu stays within Telegram limits ----------------------
@@ -165,7 +193,10 @@ assert.strictEqual(wa.hasCreds(), false);
   const chatButtons = handler.chatKeyboard(JID).reply_markup.inline_keyboard.flat();
   const groupButtons = handler.groupKeyboard('120363000000000000@g.us').reply_markup.inline_keyboard.flat();
   assert.ok(menuButtons.length >= 8, 'menu grew with media and chat actions');
-  assert.ok(chatButtons.length >= 14, 'chat actions cover mute, pin, archive, read, clear, delete, block, info');
+  assert.ok(chatButtons.length >= 17, 'chat actions cover mute, pin, archive, read, clear, delete, block, report, copy, info');
+  assert.ok(chatButtons.some(b => b.callback_data === 'wac:report'));
+  assert.ok(chatButtons.some(b => b.callback_data === 'wac:copy'));
+  assert.ok(chatButtons.some(b => b.callback_data === 'wac:block'));
   assert.strictEqual(groupButtons.length, 4);
   for (const button of [...menuButtons, ...chatButtons, ...groupButtons]) {
     assert.ok(Buffer.byteLength(button.callback_data) <= 64, `callback_data too long: ${button.callback_data}`);

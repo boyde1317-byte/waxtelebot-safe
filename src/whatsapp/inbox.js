@@ -20,6 +20,18 @@ function mediaTypeOf(message) {
   return MEDIA_TYPES.find(type => message[type]) || null;
 }
 
+function textOf(message) {
+  const inner = innerMessage(message);
+  if (!inner) return null;
+  if (typeof inner.conversation === 'string' && inner.conversation) return inner.conversation;
+  if (typeof inner.extendedTextMessage?.text === 'string') return inner.extendedTextMessage.text;
+  for (const type of MEDIA_TYPES) {
+    const caption = inner[type]?.caption;
+    if (typeof caption === 'string' && caption) return caption;
+  }
+  return null;
+}
+
 function innerMessage(message) {
   if (!message) return null;
   for (const wrapper of ['ephemeralMessage', 'viewOnceMessage', 'viewOnceMessageV2']) {
@@ -30,9 +42,13 @@ function innerMessage(message) {
 
 function record(raw) {
   const type = mediaTypeOf(raw?.message);
-  if (!type || !raw?.key?.id || !raw.key.remoteJid) return;
+  const text = textOf(raw?.message);
+  const kind = type ? 'media' : text ? 'text' : null;
+  if (!kind || !raw?.key?.id || !raw.key.remoteJid) return;
   const id = raw.key.id;
   entries.set(id, {
+    kind,
+    text,
     id,
     jid: raw.key.remoteJid,
     type,
@@ -51,19 +67,28 @@ function record(raw) {
   }
 }
 
-function list({ jid = null, limit = 8 } = {}) {
+function list({ jid = null, kind = null, limit = 8 } = {}) {
   const out = [];
   for (let i = order.length - 1; i >= 0 && out.length < limit; i -= 1) {
     const entry = entries.get(order[i]);
     if (!entry) continue;
     if (jid && entry.jid !== jid) continue;
+    if (kind && entry.kind !== kind) continue;
     out.push(entry);
   }
   return out;
 }
 
+// Newest indexed text from a chat, so it can be copied from Telegram.
+function lastText(jid) {
+  const [entry] = list({ jid, kind: 'text', limit: 1 });
+  return entry ? { text: entry.text, sender: entry.sender, at: entry.at } : null;
+}
+
 function label(entry) {
-  const kind = entry.type.replace('Message', '').replace('ptv', 'video note');
+  const kind = entry.kind === 'text'
+    ? 'text'
+    : entry.type.replace('Message', '').replace('ptv', 'video note');
   const from = entry.fromMe ? 'you' : entry.sender;
   return `${kind} · ${from} · ${new Date(entry.at).toISOString().slice(0, 16).replace('T', ' ')}Z`;
 }
@@ -86,4 +111,4 @@ function attach() {
   session.setIncomingHandler(record);
 }
 
-module.exports = { attach, record, list, download, label, clear: () => { entries.clear(); order.length = 0; } };
+module.exports = { attach, record, list, download, label, lastText, clear: () => { entries.clear(); order.length = 0; } };

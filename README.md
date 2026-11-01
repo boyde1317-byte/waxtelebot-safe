@@ -48,8 +48,16 @@ The session is saved to `WA_AUTH_DIR`, so the bot reconnects on its own after a 
 ### Chat actions
 
 `/chat <number|group>` opens the same set of actions the in-chat menu offers, one tap each: mute for 8 hours, a week
-or forever, unmute, pin, unpin, archive, unarchive, mark as read, clear messages, delete the chat, block, unblock, and
-contact info (on WhatsApp or not, about text, profile photo URL).
+or forever, unmute, pin, unpin, archive, unarchive, mark as read, clear messages, delete the chat, block, unblock,
+report, copy the last message, and contact info (on WhatsApp or not, about text, profile photo URL).
+
+**Copy** returns the newest message text received in that chat, so you can select it in Telegram. Only messages seen
+while the bot is connected are held.
+
+**Report** asks for confirmation first, because it is not reversible: "Report" or "Report and block", and WhatsApp gets
+the same spam signal the web client sends. There is no public API for it and WhatsApp never confirms receipt, so treat
+a report as a signal rather than a guaranteed removal. Report and block a number from here when the phone's own menu
+will not cooperate.
 
 Groups add invite link, member list with admins marked, and leave. Every action is a single app-state patch on the
 paired account; nothing is queued or repeated.

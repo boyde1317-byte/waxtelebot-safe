@@ -57,6 +57,24 @@ async function setBlocked(rawJid, blocked, defaultCountry) {
   return jid;
 }
 
+// WhatsApp has no public endpoint for this; it is the same spam IQ the web client sends.
+async function report(rawJid, { block = false } = {}, defaultCountry) {
+  const sock = session.requireSocket();
+  const jid = target(rawJid, defaultCountry);
+  const node = {
+    tag: 'iq',
+    attrs: { to: 's.whatsapp.net', type: 'set', xmlns: 'spam' },
+    content: [{
+      tag: 'spam_list',
+      attrs: {},
+      content: [{ tag: 'item', attrs: { jid, spam_flow: 'unsolicited' } }],
+    }],
+  };
+  await sock.query(node);
+  if (block) await sock.updateBlockStatus(jid, 'block');
+  return { jid, blocked: Boolean(block) };
+}
+
 async function contactInfo(rawJid, defaultCountry) {
   const sock = session.requireSocket();
   const jid = target(rawJid, defaultCountry);
@@ -104,6 +122,6 @@ async function leaveGroup(rawJid, defaultCountry) {
 }
 
 module.exports = {
-  setMute, setPin, setArchive, markRead, clearChat, deleteChat, setBlocked,
+  setMute, setPin, setArchive, markRead, clearChat, deleteChat, setBlocked, report,
   contactInfo, groupInvite, groupMembers, leaveGroup, muteEnd,
 };
