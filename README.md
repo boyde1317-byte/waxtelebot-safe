@@ -61,6 +61,12 @@ These are separate Baileys sessions, not devices on one account: one `makeWASock
 `creds.json` under its own folder, its own keys and reconnect state. Two sessions never share credentials, which is
 also why they cannot interfere with each other.
 
+Per account, in practice: an auth folder (`WA_ACCOUNTS_DIR/account-*/`), its socket and event handlers, its reconnect
+backoff, its hourly send budget, its rows in `wa_sends`, and its own slice of the recent-message buffer — the cap in
+`WA_INBOX_LIMIT` applies to each account separately, so one chatty number cannot evict another's media. Shared by
+the whole fleet: the single SQLite file (rows carry `account_id`), the Node process and event loop, and the one
+Telegram bot.
+
 `/unpair` removes just the active account: it logs out, deletes that folder, and the others keep running. Boot
 reconnects them one at a time (`WA_RESTORE_GAP_MS`) so the handshakes do not collide. An install that was paired
 before accounts existed keeps its session: the old `WA_AUTH_DIR` folder is adopted as the first account.

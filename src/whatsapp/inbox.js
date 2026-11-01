@@ -70,9 +70,26 @@ function record(raw, account = null) {
     caption: innerMessage(raw.message)?.[type]?.caption || '',
   });
   order.push(id);
-  while (order.length > config.waInboxLimit) {
-    const dropped = order.shift();
-    entries.delete(dropped);
+
+  // The buffer is capped per account, not overall: one chatty number must not
+  // push another account's recent media out of the list.
+  const limit = config.waInboxLimit;
+  const accountId = account?.id ?? null;
+  let kept = 0;
+  for (let index = order.length - 1; index >= 0; index -= 1) {
+    const held = entries.get(order[index]);
+    if (!held || (held.accountId ?? null) !== accountId) continue;
+    kept += 1;
+    if (kept > limit) {
+      entries.delete(order[index]);
+      order.splice(index, 1);
+    }
+  }
+
+  // Backstop for a roster far larger than the configured cap.
+  const ceiling = limit * Math.max(8, config.waMaxAccounts);
+  while (order.length > ceiling) {
+    entries.delete(order.shift());
   }
 }
 

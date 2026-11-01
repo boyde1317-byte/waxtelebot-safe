@@ -4,6 +4,7 @@ process.env.ADMIN_IDS = '42';
 process.env.WA_ENABLED = '1';
 process.env.WA_DEFAULT_COUNTRY = '233';
 process.env.WA_MAX_ACCOUNTS = '12';
+process.env.WA_INBOX_LIMIT = '3';
 process.env.WA_SEND_HOURLY_CAP = '2';
 process.env.WA_SEND_MIN_INTERVAL_MS = '0';
 process.env.WA_ACCOUNTS_DIR = '/tmp/waxtele-accounts-test';
@@ -341,6 +342,17 @@ const GROUP = '120363000000000000@g.us';
   assert.ok(indexedMessage.content[0], 'the indexed protobuf is attached');
   assert.deepStrictEqual(indexedMessage.content[0].attrs, { v: '3', mediatype: 'image' });
   assert.strictEqual(fromIndex.status, 'confirmed');
+
+  // --- the recent buffer is per account, not shared ---------------------
+  for (let i = 0; i < 3; i += 1) {
+    inbox.record({ key: { id: `BULK${i}`, remoteJid: JID }, message: { conversation: `bulk ${i}` } }, first.status());
+  }
+  assert.strictEqual(inbox.list({ accountId: second.id }).length, 1, "a busy account cannot evict another account's entry");
+  const firstIds = inbox.list({ accountId: first.id }).map(item => item.id);
+  assert.strictEqual(firstIds.length, 3, "the busy account keeps its own cap");
+  assert.ok(!firstIds.includes('MEDIA1'), 'its oldest entry is the one that goes');
+  assert.ok(firstIds.includes('BULK2'), 'its newest entry stays');
+
 
   // --- removing one account leaves the other alone ----------------------
   await accounts.remove(second.id);
