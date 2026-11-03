@@ -25,9 +25,24 @@ startHandler.register(bot);
 adminHandler.register(bot);
 bot.on('message', ctx => ctx.reply('Use /help to see available commands.'));
 
+// Telegram answering 502/504 is their outage, not a bad token. Exiting on it
+// turns a blip into a crash loop, so keep retrying with backoff instead.
+async function launchWithRetry() {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await bot.launch({ dropPendingUpdates: false });
+      return;
+    } catch (error) {
+      const delay = Math.min(60000, 2000 * Math.min(attempt, 30));
+      log.error('Telegram launch failed (%s); retrying in %ss', error.message, Math.round(delay / 1000));
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+}
+
 async function main() {
   log.info('Starting feedback bot; admins: %s', config.adminIds.join(', ') || '(none)');
-  await bot.launch({ dropPendingUpdates: false });
+  await launchWithRetry();
   log.info('Bot is live.');
   if (config.waEnabled) {
     accounts.init();
@@ -51,6 +66,9 @@ function shutdown(signal) {
 
 process.once('SIGINT', () => shutdown('SIGINT'));
 process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.on('unhandledRejection', error => {
+  log.error('Unhandled rejection: %s', (error && error.stack) || error);
+});
 main().catch(error => {
   log.error('Fatal: %s', error.stack || error.message);
   process.exit(1);
