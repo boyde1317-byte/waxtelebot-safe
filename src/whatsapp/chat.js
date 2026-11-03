@@ -84,27 +84,49 @@ function reportIdFrom(result) {
   return null;
 }
 
-// Builds the spam IQ for one indexed message. Exported so the shape can be tested.
-function buildSpamIq(entry, { flow, subject = null } = {}) {
+const SPAM_CATEGORIES = {
+  spam: { flow: '1', label: 'Spam' },
+  scam: { flow: '3', label: 'Scam / Fraud' },
+  harass: { flow: '2', label: 'Harassment' },
+  offensive: { flow: '4', label: 'Offensive Content' },
+  general: { flow: 'MessageMenu', label: 'General' },
+};
+
+function formatMessageNode(item) {
   const { proto } = require('baileys');
+  const messageAttrs = { id: item.id, t: String(Math.floor((item.at || Date.now()) / 1000)) };
+  if (item.fromJid) messageAttrs.from = item.fromJid;
+  if (item.isGroup && item.participant) messageAttrs.participant = item.participant;
+
+  const messageChildren = [];
+  if (item.inner) {
+    const rawAttrs = { v: '3' };
+    if (item.mediaType) rawAttrs.mediatype = item.mediaType;
+    const bytes = proto.Message.encode(proto.Message.fromObject(item.inner)).finish();
+    messageChildren.push({ tag: 'raw', attrs: rawAttrs, content: Buffer.from(bytes) });
+  }
+  return { tag: 'message', attrs: messageAttrs, content: messageChildren };
+}
+
+// Builds the spam IQ for an indexed message with up to 5 context messages. Exported so the shape can be tested.
+function buildSpamIq(entry, { flow, subject = null, contextEntries = [] } = {}) {
   const spamFlow = flow || (entry.isGroup ? 'GroupInfoReport' : 'MessageMenu');
-  const listAttrs = { spam_flow: spamFlow };
+  const listAttrs = { spam_flow: String(spamFlow) };
   if (entry.isGroup) {
     listAttrs.jid = entry.jid;
     if (subject) listAttrs.subject = subject;
   }
 
-  const messageAttrs = { id: entry.id, t: String(Math.floor(entry.at / 1000)) };
-  if (entry.fromJid) messageAttrs.from = entry.fromJid;
-  if (entry.isGroup && entry.participant) messageAttrs.participant = entry.participant;
-
-  const messageChildren = [];
-  if (entry.inner) {
-    const rawAttrs = { v: '3' };
-    if (entry.mediaType) rawAttrs.mediatype = entry.mediaType;
-    const bytes = proto.Message.encode(proto.Message.fromObject(entry.inner)).finish();
-    messageChildren.push({ tag: 'raw', attrs: rawAttrs, content: Buffer.from(bytes) });
+  const allEntries = [entry];
+  if (Array.isArray(contextEntries)) {
+    for (const ctx of contextEntries) {
+      if (ctx && ctx.id !== entry.id && allEntries.length < 5) {
+        allEntries.push(ctx);
+      }
+    }
   }
+
+  const messageNodes = allEntries.map(formatMessageNode);
 
   return {
     tag: 'iq',
@@ -112,12 +134,12 @@ function buildSpamIq(entry, { flow, subject = null } = {}) {
     content: [{
       tag: 'spam_list',
       attrs: listAttrs,
-      content: [{ tag: 'message', attrs: messageAttrs, content: messageChildren }],
+      content: messageNodes,
     }],
   };
 }
 
-async function reportMessage(account, entry, { block = false, flow = null, subject = null } = {}) {
+async function reportMessage(account, entry, { block = false, flow = null, subject = null, contextLimit = 5, contextEntries = null } = {}) {
   if (!entry?.id) throw new Error('There is no message to report.');
 
   const isConnected = account.status ? account.status().connected : Boolean(account.socket);
@@ -133,8 +155,18 @@ async function reportMessage(account, entry, { block = false, flow = null, subje
     };
   }
 
+  let recentMessages = contextEntries;
+  if (!recentMessages) {
+    try {
+      const inbox = require('./inbox');
+      recentMessages = inbox.list({ accountId: account.id, jid: entry.jid, limit: contextLimit });
+    } catch {
+      recentMessages = [entry];
+    }
+  }
+
   const sock = account.requireSocket();
-  const node = buildSpamIq(entry, { flow, subject });
+  const node = buildSpamIq(entry, { flow, subject, contextEntries: recentMessages });
   let result;
   try {
     result = await sock.query(node, config.waQueryTimeoutMs);
@@ -350,5 +382,5 @@ async function leaveGroup(account, rawJid, defaultCountry) {
 module.exports = {
   setMute, setPin, setArchive, markRead, clearChat, deleteChat, setBlocked,
   reportMessage, reportMessageAll, reportWithAutoCascade, buildSpamIq, reportIdFrom,
-  contactInfo, groupInvite, groupMembers, leaveGroup, muteEnd,
+  contactInfo, groupInvite, groupMembers, leaveGroup, muteEnd, SPAM_CATEGORIES,
 };

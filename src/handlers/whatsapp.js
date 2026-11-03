@@ -403,22 +403,18 @@ async function runChatAction(ctx, session, jid, action) {
         const pairedCount = accounts.list().filter(a => a.status.hasCreds).length;
         const inlineKeyboard = [
           [
-            { text: 'Report', callback_data: `wacr:solo:${token}` },
-            { text: 'Report and block', callback_data: `wacr:block:${token}` },
+            { text: `Route all (Spam)`, callback_data: `wacr:all:spam:${token}` },
+            { text: 'Route & block all', callback_data: `wacr:all_block:spam:${token}` },
+          ],
+          [
+            { text: 'Route (Scam/Fraud)', callback_data: `wacr:all:scam:${token}` },
+            { text: 'Route (Harassment)', callback_data: `wacr:all:harass:${token}` },
+          ],
+          [
+            { text: 'Solo report', callback_data: `wacr:solo:spam:${token}` },
+            { text: 'Cancel', callback_data: `wacr:cancel:${token}` },
           ],
         ];
-        if (pairedCount > 1) {
-          inlineKeyboard.push([
-            { text: `Report all (${pairedCount} sessions)`, callback_data: `wacr:all:${token}` },
-            { text: 'Report & block all', callback_data: `wacr:all_block:${token}` },
-          ]);
-        } else {
-          inlineKeyboard.push([
-            { text: 'Report (all paired sessions)', callback_data: `wacr:all:${token}` },
-            { text: 'Report & block all', callback_data: `wacr:all_block:${token}` },
-          ]);
-        }
-        inlineKeyboard.push([{ text: 'Cancel', callback_data: `wacr:cancel:${token}` }]);
 
         return ctx.reply(
           [
@@ -615,8 +611,12 @@ function register(bot) {
         reply_markup: {
           inline_keyboard: [
             [
-              { text: `Route to all (${pairedCount || 1})`, callback_data: `wacr:all:${token}` },
-              { text: 'Route & block all', callback_data: `wacr:all_block:${token}` },
+              { text: `Route to all (${pairedCount || 1}) · Spam`, callback_data: `wacr:all:spam:${token}` },
+              { text: 'Route & block all', callback_data: `wacr:all_block:spam:${token}` },
+            ],
+            [
+              { text: 'Route (Scam/Fraud)', callback_data: `wacr:all:scam:${token}` },
+              { text: 'Route (Harassment)', callback_data: `wacr:all:harass:${token}` },
             ],
             [
               { text: 'Cancel', callback_data: `wacr:cancel:${token}` },
@@ -834,7 +834,23 @@ function register(bot) {
   bot.action(/^wacr:(.+)$/, async ctx => {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
     const raw = ctx.match[1];
-    const [choice, token] = raw.split(':');
+    const parts = raw.split(':');
+    let choice, categoryKey, token;
+    if (parts.length === 2) {
+      [choice, token] = parts;
+      categoryKey = 'spam';
+    } else {
+      [choice, categoryKey, token] = parts;
+    }
+
+    const SPAM_FLOWS = {
+      spam: '1',
+      scam: '3',
+      harass: '2',
+      offensive: '4',
+      general: 'MessageMenu',
+    };
+    const flow = SPAM_FLOWS[categoryKey] || '1';
 
     if (!token || !pendingReports.has(token)) {
       await ctx.answerCbQuery('Invalid or expired');
@@ -896,7 +912,7 @@ function register(bot) {
         const sessionsToRoute = pairedRows.map(r => accounts.get(r.id)).filter(Boolean);
         if (!sessionsToRoute.length) sessionsToRoute.push(session);
 
-        const results = await chat.reportMessageAll(sessionsToRoute, entry, { block: doBlock, subject });
+        const results = await chat.reportMessageAll(sessionsToRoute, entry, { block: doBlock, subject, flow });
 
         const lines = [`Report routed through ${results.length} paired session(s):`];
         for (const r of results) {
@@ -926,7 +942,7 @@ function register(bot) {
     // Solo report: only reports through the active session without automatic cascading
     await ctx.answerCbQuery(doBlock ? 'Reporting and blocking…' : 'Reporting…');
     try {
-      const result = await chat.reportMessage(session, entry, { block: doBlock, subject });
+      const result = await chat.reportMessage(session, entry, { block: doBlock, subject, flow });
       const lines = [];
       if (result.status === 'confirmed') {
         lines.push(`WhatsApp accepted the report (id ${result.reportId}). That is the server acknowledging it, not a promise of removal.`);

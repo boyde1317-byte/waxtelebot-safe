@@ -381,6 +381,24 @@ const GROUP = '120363000000000000@g.us';
   assert.strictEqual(cascadeRes.cascaded[1].accountId, unconn.id);
   assert.strictEqual(cascadeRes.cascaded[1].status, 'disconnected');
 
+  // --- multi-message context and spam categories tests ---
+  assert.ok(chat.SPAM_CATEGORIES.scam);
+  assert.strictEqual(chat.SPAM_CATEGORIES.scam.flow, '3');
+  assert.strictEqual(chat.SPAM_CATEGORIES.harass.flow, '2');
+
+  const multiIq = chat.buildSpamIq(entry, {
+    flow: chat.SPAM_CATEGORIES.scam.flow,
+    contextEntries: [
+      { id: 'CTX1', at: 1000000, fromJid: JID },
+      { id: 'CTX2', at: 2000000, fromJid: JID },
+      { id: 'CTX3', at: 3000000, fromJid: JID },
+    ],
+  });
+  assert.strictEqual(multiIq.content[0].attrs.spam_flow, '3', 'carries scam spam flow');
+  assert.strictEqual(multiIq.content[0].content.length, 4, 'contains primary message + 3 context messages');
+  assert.strictEqual(multiIq.content[0].content[0].attrs.id, entry.id);
+  assert.strictEqual(multiIq.content[0].content[1].attrs.id, 'CTX1');
+
   // --- report response classification & timeout & blocking error tests ---
   fakeSocket.queryResult = { tag: 'iq', attrs: { type: 'error' }, content: [] };
   const errReport = await chat.reportMessage(first, entry);
