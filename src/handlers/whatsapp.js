@@ -106,7 +106,8 @@ function accountTag(row) {
 }
 
 function statusLine(session) {
-  const s = session.status();
+  // A row can have no live session yet (boot ordering), so never deref blindly.
+  const s = session ? session.status() : { state: 'idle', connected: false, hasCreds: false };
   const bits = [s.connected ? 'connected' : s.state === 'pairing' ? 'waiting for the code' : `not connected (${s.state})`];
   if (s.since) bits.push(`since ${s.since.slice(0, 16).replace('T', ' ')}Z`);
   if (!s.connected && s.lastError) bits.push(s.lastError);
