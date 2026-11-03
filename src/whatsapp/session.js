@@ -31,6 +31,8 @@ function createSession({ id, label, authDir }) {
 
   let sock = null;
   let reconnectTimer = null;
+  let pendingPair = null;
+  let pendingPairFail = null;
   let attempts = 0;
   let stopping = false;
   let everConnected = false;
@@ -106,7 +108,10 @@ function createSession({ id, label, authDir }) {
     fs.mkdirSync(authDir, { recursive: true });
 
     const { state: authState, saveCreds } = await b.useMultiFileAuthState(authDir);
-    const versionInfo = await b.fetchLatestBaileysVersion().catch(() => ({}));
+    // Upstream fetchLatestBaileysVersion() can report a stale WA Web build as
+    // "latest", and WhatsApp refuses the device link when an old build is
+    // presented. Pin explicitly and bump this when WhatsApp ships a new one.
+    const versionInfo = { version: [2, 3000, 1052661112] };
 
     everConnected = false;
     snapshot.state = authState.creds.registered ? 'connecting' : 'pairing';
@@ -115,7 +120,9 @@ function createSession({ id, label, authDir }) {
     sock = b.makeWASocket({
       ...(versionInfo.version ? { version: versionInfo.version } : {}),
       auth: authState,
-      browser: b.Browsers.ubuntu('Chrome'),
+      // Canonical platform tuple: the pairing flow validates the companion
+      // platform display far more strictly than QR login does.
+      browser: b.Browsers.macOS('Safari'),
       syncFullHistory: false,
       markOnlineOnConnect: false,
       generateHighQualityLinkPreview: false,
@@ -143,7 +150,7 @@ function createSession({ id, label, authDir }) {
     const digits = toPhoneDigits(phone, config.waDefaultCountry);
     if (!digits) throw new Error('That does not look like a phone number. Include the country code, e.g. +233241234567.');
 
-    const code = await requestPairingCode(digits);
+    const code = await pairOnceReady(digits);
     snapshot.state = 'pairing';
     snapshot.number = digits;
     db.updateAccount(id, { phone: digits });
@@ -151,22 +158,46 @@ function createSession({ id, label, authDir }) {
     return { ...status(), code };
   }
 
+  // WhatsApp only accepts the pairing request once the WebSocket session is
+  // live. Requesting it straight after makeWASocket races the cold start and
+  // the issued code is dead on arrival, so wait for the first `qr` event.
+  function pairOnceReady(digits) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingPair = null;
+        pendingPairFail = null;
+        reject(new Error('Timed out waiting for the WhatsApp session to come up.'));
+      }, 45000);
+      pendingPairFail = reason => {
+        clearTimeout(timer);
+        reject(reason);
+      };
+      pendingPair = async () => {
+        pendingPairFail = null;
+        clearTimeout(timer);
+        try {
+          resolve(await requestPairingCode(digits));
+        } catch (error) {
+          reject(error);
+        }
+      };
+    });
+  }
+
   async function requestPairingCode(digits) {
-    let lastError = null;
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      try {
-        const code = await sock.requestPairingCode(digits);
-        if (code) return code;
-      } catch (error) {
-        lastError = error;
-      }
-      await sleep(1500);
-    }
-    throw lastError || new Error('WhatsApp did not return a pairing code.');
+    if (!sock) throw new Error('The WhatsApp session closed before a pairing code could be requested.');
+    return sock.requestPairingCode(digits);
   }
 
   function handleConnectionUpdate(b, update) {
     const { connection, lastDisconnect } = update;
+
+    // The first qr event proves the WS session with WhatsApp is established.
+    if (update.qr && pendingPair && sock) {
+      const fire = pendingPair;
+      pendingPair = null;
+      fire();
+    }
 
     if (connection === 'open') {
       everConnected = true;
@@ -190,6 +221,12 @@ function createSession({ id, label, authDir }) {
     snapshot.state = 'closed';
     snapshot.lastError = `${reason}${statusCode ? ` (${statusCode})` : ''}`;
     sock = null;
+    if (pendingPairFail) {
+      const fail = pendingPairFail;
+      pendingPairFail = null;
+      pendingPair = null;
+      fail(new Error(snapshot.lastError));
+    }
 
     const loggedOut = statusCode === b.DisconnectReason.loggedOut || statusCode === 401;
     if (loggedOut) {
