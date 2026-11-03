@@ -66,6 +66,34 @@ function isAdmin(ctx) {
   return config.adminIds.includes(ctx.from?.id);
 }
 
+function staleRows() {
+  return accounts.list().filter(row => !row.status.connected && !row.status.hasCreds);
+}
+
+// Owner/admin only: these sessions hold no credentials, so wiping only deletes
+// the local records. It cannot unlink a device on the phone, because there is
+// nothing left to log out with.
+function staleSummary(callbackData) {
+  const rows = staleRows();
+  const lines = rows.map(row => `- ${row.label}${row.phone ? ` +${row.phone}` : ''} (${row.status.state})`);
+  return {
+    text: [
+      `Failed or stale sessions (${rows.length} of ${accounts.list().length}):`,
+      ...lines,
+      '',
+      'Wiping logs them out and deletes them. Linked devices that still work are untouched.',
+    ].join('\n'),
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: `Wipe ${rows.length}`, callback_data: callbackData },
+          { text: 'Cancel', callback_data: 'wa:menu' },
+        ],
+      ],
+    },
+  };
+}
+
 function requireAdmin(ctx) {
   if (isAdmin(ctx)) return true;
   ctx.reply('This command is restricted to administrators.');
@@ -160,6 +188,9 @@ function menuKeyboard(adminId, page = 0) {
         [
           { text: 'Account status', callback_data: 'wa:status' },
           { text: 'Unpair this account', callback_data: 'wa:unpairask' },
+        ],
+        [
+          { text: 'Wipe failed/stale sessions', callback_data: 'wa:wipestaleask' },
         ],
       ],
     },
@@ -526,6 +557,14 @@ function register(bot) {
     return ctx.reply(`Switched to ${pick.label}${pick.phone ? ` +${pick.phone}` : ''}.`);
   });
 
+  bot.command('wipestale', async ctx => {
+    if (!requireAdmin(ctx)) return;
+    const rows = staleRows();
+    if (!rows.length) return ctx.reply('Nothing to wipe: every session either is connected or still holds credentials.');
+    const { text, reply_markup } = staleSummary('wa:wipestaledo');
+    return ctx.reply(text, { reply_markup });
+  });
+
   bot.command('pair', async ctx => {
     if (!requireAdmin(ctx)) return;
     const phone = ctx.message.text.replace(/^\/pair\s*/i, '').trim();
@@ -690,6 +729,28 @@ function register(bot) {
       return `${row.label}${row.phone ? ` +${row.phone}` : ''}: ${session ? statusLine(session) : 'no session'}`;
     });
     return ctx.reply(lines.join('\n'));
+  });
+
+  // Toggle entry point. The wipe itself needs a second press, so a mistap on
+  // the menu cannot drop half the roster.
+  bot.action('wa:wipestaleask', async ctx => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
+    await ctx.answerCbQuery();
+    const rows = staleRows();
+    if (!rows.length) return ctx.reply('Nothing to wipe: every session either is connected or still holds credentials.');
+    const { text, reply_markup } = staleSummary('wa:wipestaledo');
+    return ctx.reply(text, { reply_markup });
+  });
+
+  bot.action('wa:wipestaledo', async ctx => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Admins only.');
+    await ctx.answerCbQuery('Wiping...');
+    const result = await accounts.wipeStale();
+    if (!result.wiped.length) return ctx.reply('Nothing to wipe.');
+    return ctx.reply(
+      `Wiped ${result.wiped.length} session(s): ${result.wiped.join(', ')}.\n` +
+      `${result.remaining} account(s) left.`,
+    );
   });
 
   bot.action('wa:unpairask', async ctx => {

@@ -143,7 +143,28 @@ function summaryLine(adminId) {
   return `${current.snapshot.label}${current.snapshot.number ? ` +${current.snapshot.number}` : ''} · ${connected}/${rows.length} connected`;
 }
 
+// Sessions that never linked, or whose credentials were wiped after a failed
+// pairing. Nothing can reconnect from these, so they only clutter /accounts.
+function stale() {
+  return list().filter(row => !row.status.connected && !row.status.hasCreds);
+}
+
+// Logs out and deletes every stale session. Returns what actually went.
+async function wipeStale() {
+  const victims = stale();
+  const wiped = [];
+  for (const row of victims) {
+    try {
+      await remove(row.id);
+      wiped.push(row.label);
+    } catch (error) {
+      log.warn('Could not wipe %s: %s', row.label, error.message);
+    }
+  }
+  return { wiped, total: victims.length, remaining: list().length };
+}
+
 module.exports = {
   init, restoreAll, subscribeAll, create, remove, list, get, active, setActive, stopAll,
-  summaryLine, newAccountDir, phoneClash,
+  summaryLine, newAccountDir, phoneClash, stale, wipeStale,
 };
